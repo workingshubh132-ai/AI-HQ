@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { lookupAction, allActionTypes, TIER, SIDE_EFFECT } from '../src/actions.js';
 import { createTools } from '../src/tools.js';
 
-const SOURCE_FILES = ['../src/actions.js', '../src/tools.js', '../src/broker.js', '../src/store.js', '../src/audit.js'];
+const SOURCE_FILES = ['../src/actions.js', '../src/tools.js', '../src/broker.js', '../src/store.js', '../src/audit.js', '../src/payload.js'];
 
 /** Removes block and line comments so prose cannot trip a code check. */
 function stripComments(src) {

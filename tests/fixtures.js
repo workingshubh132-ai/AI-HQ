@@ -9,6 +9,7 @@ import { createTools } from '../src/tools.js';
 import { createMemoryStore } from '../src/store.js';
 import { createAuditSink } from '../src/audit.js';
 import { createBroker } from '../src/broker.js';
+import { hashPayload, renderPayload } from '../src/payload.js';
 
 export const T0 = 1_000_000;
 export const TASK = 'task-1';
@@ -97,18 +98,42 @@ export function request(o = {}) {
   };
 }
 
-/** A well-formed granted approval. */
+/**
+ * A well-formed granted approval, with integrity fields computed to match.
+ *
+ * Pass `approved_payload_hash` explicitly (including a wrong value) to
+ * simulate tampering; otherwise it is derived from the effective payload.
+ */
 export function approval(o = {}) {
-  return {
+  const base = {
     task_id: TASK,
+    tool_id: 'fake.send_message',
     action_type: 'message.send',
     status: 'approved',
     payload: { recipient_domain: 'approved-client.example', body: 'proposal' },
     approved_payload: null,
+    agent_intent: 'Send the proposal to the client',   // UNTRUSTED
     decided_by: 'founder',
     decided_at: T0 - 100,
     expires_at: null,
     ...o,
+  };
+
+  const effective = base.approved_payload ?? base.payload;
+
+  return {
+    ...base,
+    payload_hash: 'payload_hash' in o ? o.payload_hash : hashPayload(base.payload),
+    approved_payload_hash:
+      'approved_payload_hash' in o
+        ? o.approved_payload_hash
+        : base.status === 'approved'
+          ? hashPayload(effective)
+          : null,
+    rendered_description:
+      'rendered_description' in o
+        ? o.rendered_description
+        : renderPayload(base.tool_id, base.action_type, effective),
   };
 }
 

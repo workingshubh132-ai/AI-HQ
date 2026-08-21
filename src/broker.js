@@ -14,6 +14,7 @@
  */
 
 import { lookupAction, tierRank, TIER, SIDE_EFFECT } from './actions.js';
+import { stableStringify, hashPayload } from './payload.js';
 
 /** Three outcomes, deliberately distinct (DECISIONS D-c). */
 export const DECISION = Object.freeze({
@@ -47,6 +48,7 @@ export const REASON = Object.freeze({
   APPROVAL_NOT_GRANTED: 'APPROVAL_NOT_GRANTED',
   APPROVAL_MISMATCH: 'APPROVAL_MISMATCH',
   APPROVAL_EXPIRED: 'APPROVAL_EXPIRED',
+  APPROVAL_PAYLOAD_MISMATCH: 'APPROVAL_PAYLOAD_MISMATCH',
   INVALID_APPROVAL: 'INVALID_APPROVAL',
   IDEMPOTENCY_KEY_REQUIRED: 'IDEMPOTENCY_KEY_REQUIRED',
   IDEMPOTENCY_IN_FLIGHT: 'IDEMPOTENCY_IN_FLIGHT',
@@ -59,14 +61,6 @@ const AGENT_STATES = Object.freeze([
   'draft', 'testing', 'active', 'degraded', 'paused', 'frozen', 'retired',
 ]);
 const APPROVAL_STATUSES = Object.freeze(['pending', 'approved', 'rejected']);
-
-/** Deterministic serialization so payload comparison is order-independent. */
-function stableStringify(value) {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
-  const keys = Object.keys(value).sort();
-  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
-}
 
 /** Fails closed: anything not provably well-formed is rejected. */
 function validateAgent(agent) {
@@ -90,6 +84,11 @@ function validateApproval(approval) {
   if (approval.status === 'approved') {
     if (typeof approval.decided_by !== 'string' || approval.decided_by === '') return 'approved without decided_by';
     if (!Number.isFinite(approval.decided_at)) return 'approved without decided_at';
+    // Fail closed: an approval that does not record WHICH BYTES were granted
+    // authorizes nothing, however well-formed it otherwise looks.
+    if (!/^[a-f0-9]{64}$/.test(approval.approved_payload_hash ?? '')) {
+      return 'approved without a valid approved_payload_hash';
+    }
   }
   if (approval.expires_at != null && !Number.isFinite(approval.expires_at)) return 'unparseable expires_at';
   if (approval.approved_payload != null && typeof approval.approved_payload !== 'object') {
@@ -296,6 +295,20 @@ export function createBroker({ tools, store, audit, clock }) {
           return settle(DECISION.DENY, REASON.APPROVAL_EXPIRED, resolution.detail);
         case 'GRANTED': {
           effectivePayload = resolution.effective_payload;
+
+          // ── PAYLOAD INTEGRITY ──────────────────────────────────────────
+          // The human approved a specific sequence of bytes. This compares
+          // the hash of what is about to run against the hash of what was
+          // authorized. If anything changed in between — by an agent, a bug,
+          // or a rewritten record — they differ and nothing executes.
+          //
+          // A human approving A must never cause the system to execute B.
+          const executionHash = hashPayload(effectivePayload);
+          if (executionHash !== resolution.approval.approved_payload_hash) {
+            return settle(DECISION.DENY, REASON.APPROVAL_PAYLOAD_MISMATCH,
+              `approved ${resolution.approval.approved_payload_hash.slice(0, 12)}…, execution ${executionHash.slice(0, 12)}…`);
+          }
+
           // Re-check scope against what will ACTUALLY execute. A human edit
           // that moves the payload outside the tool's declared bounds is
           // almost certainly a mistake, and this is the last place to catch
