@@ -488,6 +488,80 @@ visible by contrast.
 
 ---
 
+## D24 — The model boundary is a second gate, structurally unable to reach the Broker
+
+Decided 2026-08-21 (Milestone 7).
+
+`src/providers.js` (an explicit, closed registry — no `register()` method,
+so nothing can add a provider at runtime) and `src/model-runtime.js` (the
+governed path from a request to a provider's response) give agents a
+`callModel()` capability alongside the existing `callTool()`.
+
+**The structural guarantee, not just a convention:** `createModelRuntime`
+takes no `store`, no `broker`, no reference to `agents.js`'s mutation
+functions. It cannot grant clearance, approve a version, modify a freeze,
+or call a tool, because none of those are reachable from its scope — not
+because it declines to use them. Mutation-tested: giving `invokeModel` a
+`broker.execute` reference and exposing it fails test 138 immediately,
+proving the test actually depends on the absence, not merely asserts it.
+
+**The stronger claim, proven adversarially (test 139):** a handler that
+*blindly forwards* a model's output straight into `callTool()` — including
+output engineered to look like `{approved: true, proposed_tool: ...}` — is
+still denied by the Broker on the agent's actual clearance and allowlist.
+The model's word changes nothing, because the Broker's `authorize()`
+signature has no field for it to occupy.
+
+**Retry ceiling is clamped, not merely configured.** A request cannot ask
+for unlimited retries: `MAX_RETRY_CEILING = 3` bounds it regardless of
+what the request or the model's own config claims. Mutation-tested:
+removing the clamp turns a `max_retries: 999` request into 1,000 real
+provider calls.
+
+**On "timeout," stated honestly.** The mock provider is synchronous. This
+milestone measures elapsed time via the injected clock and classifies a
+call that exceeded its ceiling as `TIMEOUT` *after* it returns — it does
+not preemptively cancel a call in progress. Real cancellation needs a
+genuinely asynchronous, abortable provider, which does not exist yet.
+Described this way deliberately, not left to be assumed.
+
+**Budget covers one dimension only.** `modelBudgets` enforces a spend
+ceiling per `(provider_id, model_id)` pair, in a fictional `COST_UNITS` —
+explicitly not ₹, not $, and not derived from any real provider's
+pricing. Per-task and per-agent model-spend accounting are not wired to
+this layer; a model call does not yet draw against the same task/tree
+budgets the Broker already enforces for tools. Flagged as a real gap, not
+implied as covered by the parameter's name.
+
+**`checkContract` was extracted, not duplicated.** `src/contracts.js`
+holds the exact logic `runtime.js` already had; `runtime.js` now imports
+it instead of defining it locally. Pure mechanical extraction — proven by
+the full prior suite passing unchanged immediately after.
+
+**The validator's `model_config` rule is now opt-in, not overridden.**
+`validateAgentVersion(version, { tools, providers })` — `providers` is
+optional. Omitted, the exact pre-M7 message and behavior apply
+unchanged (test 84 passes byte-identical, unmodified). Supplied, a
+`model_config` naming a registered provider and model is accepted; an
+unregistered one is still rejected, now with a more specific reason.
+Mutation-tested: disabling the registered-provider check fails test 133,
+and a version naming `totally-fake-provider` validates as `valid: true`
+with the check off — proof the check does real work.
+
+**A real bug found by the demo agent, not invented for the report.**
+`runtime.js` checks `envelope.result` against `output_contract`
+regardless of `envelope.status` — a contract describes `result`'s shape in
+every state a handler returns, including a reported failure. The first
+version of `echo-agent`'s failure branch returned `result: {}`, which
+does not satisfy its own contract, so a legitimate business failure was
+reported as `OUTPUT_CONTRACT_VIOLATION` instead of the more informative
+`model call failed: BUDGET_EXCEEDED`. Fixed at the handler — both demo
+handlers now return contract-satisfying placeholder values on failure —
+deliberately not by loosening `runtime.js`'s check, which is correct as
+it stands and was left untouched.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

@@ -24,6 +24,7 @@
 
 import { taskSignature, MAX_DEPTH } from './limits.js';
 import { DECISION } from './broker.js';
+import { checkContract } from './contracts.js';
 
 export const TASK_STATUS = Object.freeze({
   PENDING: 'pending',
@@ -47,29 +48,6 @@ export const RUNTIME_REASON = Object.freeze({
   HANDLER_ERROR: 'HANDLER_ERROR',
 });
 
-const TYPE_OF = (v) => (Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v);
-
-/**
- * Deterministic contract check. Deliberately small: required keys and
- * declared types, nothing more. A schema language is not needed to prove a
- * runtime contract, and every feature added here is a feature that can be
- * wrong.
- */
-function checkContract(contract, value) {
-  if (!contract || typeof contract !== 'object') return null;
-  if (!value || typeof value !== 'object') return 'value is not an object';
-
-  for (const key of contract.required ?? []) {
-    if (value[key] === undefined || value[key] === null) return `missing required field: ${key}`;
-  }
-  for (const [key, expected] of Object.entries(contract.types ?? {})) {
-    if (value[key] === undefined) continue;
-    const actual = TYPE_OF(value[key]);
-    if (actual !== expected) return `field ${key} must be ${expected}, got ${actual}`;
-  }
-  return null;
-}
-
 /** The envelope every agent returns, checked before anything downstream sees it. */
 function checkEnvelope(envelope) {
   if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return 'envelope is not an object';
@@ -88,8 +66,12 @@ function checkEnvelope(envelope) {
  * @param {() => number} deps.clock
  * @param {Record<string, Function>} deps.handlers  deterministic agent handlers
  * @param {string} deps.registrySha  identity of the code that ran
+ * @param {{invokeModel: Function}} [deps.modelRuntime]  optional. Omitted by
+ *   every handler that doesn't call a model — which, before M7, was all of
+ *   them. Handlers that never reference `callModel` are unaffected by its
+ *   presence or absence.
  */
-export function createRuntime({ store, broker, audit, clock, handlers, registrySha }) {
+export function createRuntime({ store, broker, audit, clock, handlers, registrySha, modelRuntime }) {
   /**
    * Runs one task to completion.
    * @returns {object} the final task record
@@ -179,9 +161,19 @@ export function createRuntime({ store, broker, audit, clock, handlers, registryS
     const callTool = (tool_id, payload, idempotency_key = null) =>
       broker.execute({ agent_slug, tool_id, payload, task_id, tree_id, idempotency_key });
 
+    // The handler's only route to a model. It receives a RESULT, never a
+    // capability — invokeModel() has no reference to the Broker, to store's
+    // mutation methods, or to anything that could authorize an action.
+    // Whatever a model's output contains is exactly as untrusted as any
+    // other input a handler chooses to pass to callTool(): the Broker still
+    // decides, independent of what the model said. See DECISIONS.md D24.
+    const callModel = modelRuntime
+      ? (request) => modelRuntime.invokeModel({ ...request, agent_slug, task_id, tree_id })
+      : () => { throw new Error('no model runtime configured for this agent'); };
+
     let envelope;
     try {
-      envelope = handler({ input, callTool, DECISION });
+      envelope = handler({ input, callTool, callModel, DECISION });
     } catch (err) {
       return fail(RUNTIME_REASON.HANDLER_ERROR, String(err.message));
     }

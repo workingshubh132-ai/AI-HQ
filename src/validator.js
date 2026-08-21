@@ -61,7 +61,7 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
  * @param {{tools: Record<string,object>}} deps
  * @returns {{valid: boolean, errors: string[]}}
  */
-export function validateAgentVersion(version, { tools }) {
+export function validateAgentVersion(version, { tools, providers = null }) {
   const errors = [];
   const fail = (msg) => errors.push(msg);
 
@@ -142,14 +142,33 @@ export function validateAgentVersion(version, { tools }) {
   }
 
   // ── model configuration ───────────────────────────────────────────────
+  //
+  // The `providers` dependency is OPTIONAL and defaults to null. This is
+  // what keeps every pre-M7 caller's behavior byte-for-byte unchanged: a
+  // caller that does not know providers exist gets the old, strict rule.
+  // Only a caller that explicitly passes a registry gets the new, more
+  // precise check — never blanket-rejected, but validated against exactly
+  // what is actually registered. See DECISIONS.md D24.
   if (version.model_config !== undefined && version.model_config !== null) {
     if (!isPlainObject(version.model_config)) {
       fail('model_config must be an object');
     } else if (Object.keys(version.model_config).length > 0) {
-      // No model provider exists yet. A version claiming one is either a
-      // mistake or an attempt to reach capability that has not been built,
-      // reviewed or budgeted. Fail closed until Milestone 5.3.
-      fail('model_config must be empty: no model provider is approved yet');
+      if (!providers) {
+        // No provider registry was supplied to this validation call.
+        // Preserves the exact pre-M7 message and behavior.
+        fail('model_config must be empty: no model provider is approved yet');
+      } else {
+        const { provider_id, model_id, ...rest } = version.model_config;
+        if (typeof provider_id !== 'string' || typeof model_id !== 'string') {
+          fail('model_config must declare provider_id and model_id as strings');
+        } else if (!providers.getProvider(provider_id)) {
+          fail(`model_config names an unregistered provider: ${provider_id}`);
+        } else if (!providers.getModel(provider_id, model_id)) {
+          fail(`model_config names an unregistered model: ${provider_id}/${model_id}`);
+        } else if (Object.keys(rest).length > 0) {
+          fail(`model_config has unrecognised fields: ${Object.keys(rest).join(', ')}`);
+        }
+      }
     }
   }
 
