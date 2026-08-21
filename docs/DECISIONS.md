@@ -692,6 +692,105 @@ behind the word "cancel."
 
 ---
 
+## D26 — Multi-agent control plane: the router selects, it never authorizes
+
+Decided 2026-08-21 (Milestone 9).
+
+`src/router.js` answers exactly one question — "which eligible agent
+should handle this?" — and structurally cannot answer "is this agent
+allowed to do it?" It has no reference to the Broker, cannot call a tool,
+and cannot mutate clearance, scopes, budget authorization semantics,
+version approval, or a freeze. A caller still calls `engine.addTask()`
+with whatever `agent_slug` the router selected, exactly as before M9, and
+`addTask()`/`runtime.js` re-derive and re-check agent/version validity
+from scratch regardless of what the router said. Delete the router
+entirely, or bypass it and hand-type an agent_slug, and nothing
+downstream would notice — the same gauntlet applies either way.
+
+**Capabilities are advisory, never authorization — proven adversarially.**
+`agent.capabilities` (declared on the immutable version since M5) is
+router-matching metadata, nothing more. Test 182 constructs exactly the
+attack this claim invites: `misleading-research-agent` declares
+`capabilities: ['research']` but is authorized only for the harmless
+`text.wordcount` tool. The router selects it purely on the label match —
+that is correct, expected behavior, not a bug — and then its handler
+tries to call `lead.score`, a tool never on its `allowed_tools`. The
+Broker denies `TOOL_NOT_ALLOWED`. A capability string never became
+allowlist membership, because there is no code path by which it could.
+
+**Deterministic selection: no LLM, no randomness, no hidden heuristic.**
+Eligible candidates are filtered by a fixed, ordered rule list — agent
+resolvable, version approved, lifecycle active, not frozen, capability
+declared, workflow type supported (if required), concurrency available,
+budget not exhausted — then the first eligible candidate by ascending
+`agent_slug` wins. Same task, same store contents, same
+`ROUTING_POLICY_VERSION` → same decision, always. Mutation-tested:
+disabling `evaluateCandidate` entirely (every candidate reads as
+eligible) fails 22 of 36 router tests; each individual check
+(capability, concurrency, budget, agent freeze, global freeze, workflow
+freeze) was also mutated separately and each produces its own specific
+test failures, not just the broad one.
+
+**Health reuses `RUNTIME_STATE` — it is not a new field.**
+`RUNTIME_STATE` already has ACTIVE / PAUSED / DEGRADED / FROZEN / RETIRED,
+and the Broker and runtime.js already refuse to run anything for a
+non-`'active'` agent. Directed to add "health metadata," the actual
+addition is `setAgentHealth()` — a thin, audited wrapper over the
+*existing* `store.setLifecycleState` that records a reason and timestamp
+for a transition that was previously silent. No parallel `health_state`
+field was created. Two representations of the same fact is exactly the
+mistake D23 and D25 already rejected once each; a third instance would
+have made it a pattern.
+
+**Concurrency is reservation accounting, not real concurrency.**
+Nothing in this codebase is asynchronous — `runtime.runTask()` runs a
+task to completion synchronously within one call, so two tasks for one
+agent cannot actually overlap in wall-clock time today, and pretending
+otherwise would be dishonest. `route()` reserves a slot in its own
+in-memory `Map` when it selects an agent; a caller releases it via
+`release()` once the task reaches a terminal state. This is bookkeeping a
+future asynchronous runtime could rely on for real — tested as exactly
+that, not oversold as concurrent execution that does not exist yet.
+
+**Two genuinely new, minimal, justified additions — everything else
+reuses what already existed.** `store.listAgents()` (arity 0, read-only,
+returns the same resolved shape `getAgent` already returns) was added to
+`STORAGE_CONTRACT` because the router cannot select among candidates it
+cannot enumerate, and nothing before M9 ever needed to list every agent
+at once. `allowed_workflow_types` (an array on the immutable version,
+default empty) and `concurrency_limit` (an optional field on the mutable
+agent record, default null → the router's own ceiling) were added
+because no existing field represented either concept — checked first,
+against `git grep`, not assumed. Both are advisory: the Broker never
+reads them, `validator.js` was not touched to accommodate them, and
+`concurrency_limit` deliberately sits outside `validator.js`'s
+POLICY-checked `limits` object because it is a scheduling concern, not a
+security one. `department` and `capabilities` were requested again in
+this milestone's spec but already existed on the version since M5 — not
+duplicated, only newly exposed on `resolveAgent`'s flattened view where
+useful. A `registry_sha` field on the version was considered and
+rejected: that provenance concept already exists, per-task, in
+`runtime.js`'s task records, and duplicating it onto the version would
+create two sources of truth for the same fact.
+
+**`broker.js`, `validator.js`, and `runtime.js` were not touched at all
+this milestone.** Every M9 change lives in a new file (`router.js`,
+`demo-router-agents.js`) or is a strictly additive change to
+`agents.js`/`storage.js`/`store.js` — new optional fields with safe
+defaults, one new read-only method. No existing test needed to change
+for any of it; the entire 208-test suite from M8 passed unmodified
+before a single M9 test was added.
+
+**Deferred, deliberately.** Guardian does not exist yet — nothing here
+automatically freezes or pauses an agent; `setAgentHealth()` is a manual,
+explicitly-called API, exposed for a future Guardian to call, not
+wired to any automatic trigger. No agent-to-agent messaging of any kind
+exists; delegation, if it is ever needed, goes through the existing
+task/workflow mechanism, not a new channel. No external tool, no real
+model provider, no real network access, no production credential.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

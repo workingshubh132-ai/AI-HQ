@@ -44,13 +44,25 @@ export function versionId(agentId, version) {
 
 /**
  * @param {object} o
+ * @param {number} [o.concurrency_limit] how many tasks this agent may have
+ *   in flight at once, per the M9 router's own reservation accounting (see
+ *   router.js). NOT security-authoritative — the Broker does not consult
+ *   it, and a value here can never grant a tool call. Optional: absent
+ *   means "use the router's default ceiling." Deliberately kept off the
+ *   immutable version and off validator.js's POLICY-checked `limits`,
+ *   because concurrency is an operational scheduling concern, not a
+ *   security one — see DECISIONS.md D26.
  * @returns {object} a frozen agent runtime record
  */
-export function makeAgent({ id, slug, name, lifecycle_state = RUNTIME_STATE.ACTIVE, active_version_id = null, now = 0 }) {
+export function makeAgent({
+  id, slug, name, lifecycle_state = RUNTIME_STATE.ACTIVE, active_version_id = null,
+  concurrency_limit = null, now = 0,
+}) {
   return Object.freeze({
     id, slug, name,
     lifecycle_state,
     active_version_id,
+    concurrency_limit,
     created_at: now,
     updated_at: now,
   });
@@ -74,6 +86,13 @@ export function makeAgentVersion(v) {
     scopes: v.scopes ? Object.freeze({ ...v.scopes }) : null,
     // ── advisory / descriptive ──
     capabilities: Object.freeze([...(v.capabilities ?? [])]),
+    // Which workflow "types" this agent is meant to be routed into — router
+    // metadata only (M9), exactly as advisory as capabilities above: the
+    // Broker never reads it and it grants nothing. Empty means "no stated
+    // restriction," not "supports nothing" — an unrestricted, general
+    // agent is a legitimate declaration, not a fail-closed omission,
+    // because nothing here is a security decision. See DECISIONS.md D26.
+    allowed_workflow_types: Object.freeze([...(v.allowed_workflow_types ?? [])]),
     input_contract: Object.freeze({ ...(v.input_contract ?? {}) }),
     output_contract: Object.freeze({ ...(v.output_contract ?? {}) }),
     quality_criteria: v.quality_criteria ?? null,
@@ -111,6 +130,8 @@ export function resolveAgent(agent, version) {
     state: agent.lifecycle_state,
     version_id: agent.active_version_id ?? null,
     version_state: null,
+    // advisory, M9 — the router reads this; the Broker never does
+    concurrency_limit: agent.concurrency_limit ?? null,
   };
 
   if (!version) return base;
@@ -119,12 +140,14 @@ export function resolveAgent(agent, version) {
     ...base,
     version_id: version.version_id,
     version_state: version.state,
+    department: version.department,
     // security-authoritative, read by the Broker
     clearance: version.clearance,
     allowed_tools: version.allowed_tools,
     scopes: version.scopes ?? undefined,
     // advisory — the Broker ignores these, and must continue to
     capabilities: version.capabilities,
+    allowed_workflow_types: version.allowed_workflow_types,
     limits: version.limits,
     input_contract: version.input_contract,
     output_contract: version.output_contract,

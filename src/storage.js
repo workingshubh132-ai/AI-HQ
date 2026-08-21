@@ -28,7 +28,10 @@
  * excluded as unused introspection; a fourth, putAgent, was removed
  * outright as a latent authorization bypass. See DECISIONS.md D23.
  * addBudget was excluded for the same reason until M8 gave it a real
- * caller; see D25.
+ * caller; see D25. listAgents is new in M9: the router cannot select
+ * among candidate agents without a way to enumerate them, and nothing
+ * before M9 ever needed to. Read-only, returns the same resolved shape
+ * getAgent already returns — no new agent data, no new authority. See D26.
  *
  * Constitution: sections 6, 7, 25 (agents as data; version immutability).
  */
@@ -43,6 +46,7 @@
 export const STORAGE_CONTRACT = Object.freeze({
   // ── agents (read path the Broker depends on) ──────────────────────────
   getAgent: 1, // (slug) -> resolved flat agent | null
+  listAgents: 0, // () -> resolved flat agent[]. New in M9 — see comment above.
 
   // ── agent versions — IMMUTABLE ────────────────────────────────────────
   addAgentVersion: 1, // (version) -> version. Throws on a duplicate version_id.

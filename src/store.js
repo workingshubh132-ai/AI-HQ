@@ -86,6 +86,13 @@ function buildMemoryStore(seed = {}) {
     getAgent(slug) {
       return agents.get(slug) ?? null;
     },
+    /**
+     * Every resolved agent, for the M9 router's candidate enumeration.
+     * Same resolved shape getAgent returns — reads only, decides nothing.
+     */
+    listAgents() {
+      return [...agents.values()];
+    },
 
     // ── agent versions (IMMUTABLE) ────────────────────────────────────────
     /**
