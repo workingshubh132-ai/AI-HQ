@@ -160,3 +160,126 @@ test('58. a mismatch is audited with its reason', () => {
   assert.ok(rec, 'the mismatch must appear in the audit trail');
   assert.equal(rec.decision, DECISION.DENY);
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Milestone 4.6 — description binding
+//
+// The payload hash proves the bytes did not change after approval. It
+// proves nothing about what the human READ. These tests bind the two.
+// ─────────────────────────────────────────────────────────────────────────
+
+test('59. TEST A — matching hash and correct description executes', () => {
+  const payload = messagePayload();
+  const ctx = setup({ approvals: [approval({ payload })] });   // fixture renders correctly
+
+  const r = ctx.broker.execute(send({ payload }));
+
+  assert.equal(r.decision, DECISION.ALLOW);
+  assert.equal(r.reason, REASON.OK);
+  assert.equal(r.executed, true);
+  assert.equal(ctx.outbox.length, 1);
+});
+
+test('60. TEST B — correct hash but incorrect description is denied', () => {
+  const payload = messagePayload();
+  const ctx = setup({
+    approvals: [approval({
+      payload,
+      rendered_description: 'Tool: fake.send_message\nAction: message.send\nbody: something entirely different',
+    })],
+  });
+
+  const r = ctx.broker.execute(send({ payload }));
+
+  assert.equal(r.decision, DECISION.DENY);
+  assert.equal(r.reason, REASON.APPROVAL_DESCRIPTION_MISMATCH);
+  assert.equal(ctx.outbox.length, 0, 'nothing may be sent');
+  assert.equal(ctx.invocations(), 0, 'no handler may be invoked');
+});
+
+test('61. a benign description over a hostile payload is denied', () => {
+  // The attack the whole control exists to stop: the payload and its hash
+  // agree with each other, and the human was shown something reassuring.
+  const hostile = messagePayload({ body: 'URGENT: wire funds to account 12345' });
+  const ctx = setup({
+    approvals: [approval({
+      payload: hostile,
+      rendered_description: 'Tool: fake.send_message\nAction: message.send\nbody: Polite website follow-up\nrecipient_domain: approved-client.example',
+    })],
+  });
+
+  const r = ctx.broker.execute(send({ payload: hostile }));
+
+  assert.equal(r.reason, REASON.APPROVAL_DESCRIPTION_MISMATCH);
+  assert.equal(ctx.outbox.length, 0);
+});
+
+test('62. hash binding and description binding are independent controls', () => {
+  const payload = messagePayload();
+
+  // Correct description, wrong hash → caught by the hash check.
+  const badHash = setup({
+    approvals: [approval({ payload, approved_payload_hash: hashPayload({ other: true }) })],
+  });
+  assert.equal(badHash.broker.execute(send({ payload })).reason, REASON.APPROVAL_PAYLOAD_MISMATCH);
+
+  // Correct hash, wrong description → caught by the description check.
+  const badText = setup({
+    approvals: [approval({ payload, rendered_description: 'Tool: x\nAction: y\nsomething else' })],
+  });
+  assert.equal(badText.broker.execute(send({ payload })).reason, REASON.APPROVAL_DESCRIPTION_MISMATCH);
+
+  // Neither outbox saw anything.
+  assert.equal(badHash.outbox.length + badText.outbox.length, 0);
+});
+
+test('63. an approval rendered for a different tool cannot authorize this one', () => {
+  // The renderer includes the tool id, so the description binding also
+  // binds the tool — an approval created against another tool will not
+  // render to the same string.
+  const payload = messagePayload();
+  const ctx = setup({ approvals: [approval({ payload, tool_id: 'some.other.tool' })] });
+
+  const r = ctx.broker.execute(send({ payload }));
+
+  assert.equal(r.reason, REASON.APPROVAL_DESCRIPTION_MISMATCH);
+  assert.equal(ctx.outbox.length, 0);
+});
+
+test('64. an approved approval with no rendered_description fails closed', () => {
+  const payload = messagePayload();
+  for (const missing of [null, undefined, '']) {
+    const ctx = setup({ approvals: [approval({ payload, rendered_description: missing })] });
+    const r = ctx.broker.execute(send({ payload }));
+    assert.equal(r.reason, REASON.INVALID_APPROVAL, `rendered_description ${JSON.stringify(missing)} must fail closed`);
+    assert.equal(ctx.invocations(), 0);
+  }
+});
+
+test('65. REGRESSION — payload hash protection still holds after 4.6', () => {
+  const approved = messagePayload({ body: 'Hi, following up on your website.' });
+  const tampered = messagePayload({ body: 'URGENT: wire funds to account 12345' });
+
+  const ctx = setup({
+    approvals: [approval({
+      payload: approved,
+      approved_payload: tampered,
+      approved_payload_hash: hashPayload(approved),
+    })],
+  });
+
+  const r = ctx.broker.execute(send({ payload: approved }));
+
+  assert.equal(r.reason, REASON.APPROVAL_PAYLOAD_MISMATCH, 'the 4.5 control must not have been replaced');
+  assert.equal(ctx.outbox.length, 0);
+  assert.equal(ctx.invocations(), 0);
+});
+
+test('66. a description mismatch is audited with its reason', () => {
+  const payload = messagePayload();
+  const ctx = setup({ approvals: [approval({ payload, rendered_description: 'Tool: x\nAction: y\nwrong' })] });
+  ctx.broker.execute(send({ payload }));
+  const rec = ctx.audit.all().find((r) => r.reason === REASON.APPROVAL_DESCRIPTION_MISMATCH);
+  assert.ok(rec, 'the mismatch must appear in the audit trail');
+  assert.equal(rec.decision, DECISION.DENY);
+});

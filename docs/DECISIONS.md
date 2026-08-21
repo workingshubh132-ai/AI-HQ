@@ -344,6 +344,41 @@ send an underperforming agent *less* work rather than none.
 
 ---
 
+## D19 — The description is bound to the payload, separately from the hash
+
+Decided 2026-08-21.
+
+The authoritative human-facing approval description is derived
+deterministically from the executable payload and **verified again at
+execution time**. Agent-authored intent (`agent_intent`) is untrusted and
+authorizes nothing.
+
+**Payload hash binding and description binding are separate controls, and
+both are required.**
+
+| Control | Proves | Catches |
+| --- | --- | --- |
+| `hash(execution payload) == approved_payload_hash` | The bytes did not change after approval | A payload swapped after the human said yes |
+| `rendered_description == render(execution payload)` | The human read *those* bytes | A hostile payload displayed as something benign |
+
+**Why both:** with only the hash, an agent can write a correct payload, a
+correct hash, and a reassuring description. Everything is internally
+consistent and the human still consents to the wrong thing. With only the
+description, the payload can be swapped afterwards. Neither control implies
+the other.
+
+Verified by mutation: removing the description binding causes an approval
+displayed as *"Polite website follow-up"* to deliver a message reading
+*"URGENT: wire funds to account 12345"*. Five tests fail when it is removed.
+
+A side effect worth naming: because the renderer includes the tool id, the
+description binding also **binds the tool**. An approval created against one
+tool cannot authorize another, even with a matching action type and payload.
+
+A granted approval with no `rendered_description` fails closed.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

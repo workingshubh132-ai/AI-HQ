@@ -14,7 +14,7 @@
  */
 
 import { lookupAction, tierRank, TIER, SIDE_EFFECT } from './actions.js';
-import { stableStringify, hashPayload } from './payload.js';
+import { stableStringify, hashPayload, renderPayload } from './payload.js';
 
 /** Three outcomes, deliberately distinct (DECISIONS D-c). */
 export const DECISION = Object.freeze({
@@ -49,6 +49,7 @@ export const REASON = Object.freeze({
   APPROVAL_MISMATCH: 'APPROVAL_MISMATCH',
   APPROVAL_EXPIRED: 'APPROVAL_EXPIRED',
   APPROVAL_PAYLOAD_MISMATCH: 'APPROVAL_PAYLOAD_MISMATCH',
+  APPROVAL_DESCRIPTION_MISMATCH: 'APPROVAL_DESCRIPTION_MISMATCH',
   INVALID_APPROVAL: 'INVALID_APPROVAL',
   IDEMPOTENCY_KEY_REQUIRED: 'IDEMPOTENCY_KEY_REQUIRED',
   IDEMPOTENCY_IN_FLIGHT: 'IDEMPOTENCY_IN_FLIGHT',
@@ -88,6 +89,11 @@ function validateApproval(approval) {
     // authorizes nothing, however well-formed it otherwise looks.
     if (!/^[a-f0-9]{64}$/.test(approval.approved_payload_hash ?? '')) {
       return 'approved without a valid approved_payload_hash';
+    }
+    // An approval with no authoritative description records nothing about
+    // what the human was shown. Fail closed.
+    if (typeof approval.rendered_description !== 'string' || approval.rendered_description === '') {
+      return 'approved without a rendered_description';
     }
   }
   if (approval.expires_at != null && !Number.isFinite(approval.expires_at)) return 'unparseable expires_at';
@@ -307,6 +313,24 @@ export function createBroker({ tools, store, audit, clock }) {
           if (executionHash !== resolution.approval.approved_payload_hash) {
             return settle(DECISION.DENY, REASON.APPROVAL_PAYLOAD_MISMATCH,
               `approved ${resolution.approval.approved_payload_hash.slice(0, 12)}…, execution ${executionHash.slice(0, 12)}…`);
+          }
+
+          // ── DESCRIPTION BINDING ────────────────────────────────────────
+          // The hash above proves the payload did not change after approval.
+          // It proves nothing about what the human READ.
+          //
+          // rendered_description must be exactly what the deterministic
+          // renderer produces for the payload about to execute. If it is
+          // not, the human read a description of something else — and
+          // consent to a description of A is not consent to execute B.
+          //
+          // This also implicitly binds the tool: the renderer includes the
+          // tool id, so an approval created for a different tool cannot
+          // authorize this one.
+          const expectedDescription = renderPayload(tool.tool_id, action.action_type, effectivePayload);
+          if (resolution.approval.rendered_description !== expectedDescription) {
+            return settle(DECISION.DENY, REASON.APPROVAL_DESCRIPTION_MISMATCH,
+              'the stored description does not match a deterministic rendering of the executable payload');
           }
 
           // Re-check scope against what will ACTUALLY execute. A human edit

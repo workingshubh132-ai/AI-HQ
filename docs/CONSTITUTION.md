@@ -230,12 +230,47 @@ the human CEO. When the queue is full: **STOP or WAIT.**
 
 Approvals are eventually prioritized by risk, value, deadline, and confidence.
 
-The human sees **concise summaries**, never raw JSON:
+### What the human approves
 
-> *"Send website proposal to ABC Restaurant for ₹12,000."*
+An approval binds a human decision to **exact executable bytes**. Four fields
+carry that binding, and their trust levels differ:
 
-The originally proposed payload is **never modified**. An edited action is
-stored separately as the approved payload.
+| Field | Written by | Trust |
+| --- | --- | --- |
+| `agent_intent` | The agent | **UNTRUSTED.** Display only, clearly marked. Authorizes nothing |
+| `rendered_description` | **System code**, from the payload | **AUTHORITATIVE.** This is what the human reads |
+| `payload` / `payload_hash` | System, from the proposal | What the agent asked for |
+| `approved_payload` / `approved_payload_hash` | System, at decision time | What the human authorized |
+
+`rendered_description` is generated deterministically and is **exhaustive over
+the payload's fields**. A renderer that printed only the fields it considered
+interesting would let every other field hide from the person approving.
+
+**Two independent checks run before execution:**
+
+1. `hash(execution payload)` must equal `approved_payload_hash`.
+   Different → **DENY**. This catches a payload changed after approval.
+2. `rendered_description` must equal a fresh deterministic rendering of the
+   execution payload. Different → **DENY**. This catches a human who was
+   shown a description of something other than what will run.
+
+Both are required. Neither replaces the other: the first proves the bytes did
+not change, the second proves the human read those bytes. A system with only
+the first will faithfully execute a hostile payload that was displayed as a
+polite follow-up.
+
+> **A human approving A must never cause the system to execute B.**
+
+The originally proposed `payload` is **never modified**. A human edit is stored
+as `approved_payload`, and both the hash and the description are recomputed
+from the edit — so the human approves a description of their own version, not
+of the agent's.
+
+**Known limitation:** fields longer than 400 characters are truncated in the
+rendered description with an explicit marker naming how much is hidden. The
+hash always covers the full content, so tampering past the visible region is
+still caught, but the human has not read every byte. Truncation on a phone is
+unavoidable; making it invisible would not be.
 
 **Approval granularity** — the long-term model, so that human minutes scale
 with *number of workflow types* rather than *number of actions*:
@@ -435,6 +470,11 @@ Log: task creation · state transitions · agent runs · agent versions · tool
 calls · **denied tool calls** · CEO decisions · approval decisions · Guardian
 actions · budget events · failures.
 
+An execution record must carry enough to reconstruct what happened without
+trusting anyone's account of it: timestamp · agent · agent version · task ·
+tool · action type · tier · decision · reason · approval reference ·
+**payload hash** · idempotency key · registry identity.
+
 Append-only at the application level. Never silently modify history. **Never
 fabricate audit entries.**
 
@@ -534,6 +574,13 @@ deletion controls · auditability.
 
 **No spam. No deceptive automation.** Never fabricate personalization, case
 studies, testimonials, clients, results, or credentials.
+
+**Suppression is a Broker check, not an agent instruction.** Before any
+outbound action the Broker consults the suppression / do-not-contact list
+itself. If that data cannot be reached, the answer is **DENY** — an
+unreachable suppression list is not permission to send. An agent asserting
+that a recipient did not opt out is untrusted text, exactly like
+`agent_intent`.
 
 ### 32. B2B revenue system
 

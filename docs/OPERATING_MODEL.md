@@ -214,22 +214,67 @@ Agent: "call tool T with arguments X"
           ┌───────────────┐
           │  TOOL BROKER  │   owns every credential
           └───────────────┘
-   1. Global emergency stop active?          → DENY
-   2. Agent frozen or paused?                → DENY
-   3. Tool T in agent's allowlist?           → DENY if not
-   4. Action type known in registry?         → RED if not
-   5. Action tier ≤ agent clearance?         → DENY if not
-   6. Scope constraints satisfied?           → DENY if not
-   7. Budget available (task→tree→agent→global)? → DENY if not
-   8. Rate limit satisfied?                  → DENY if not
-   9. Tier requires approval?
-        GREEN  → proceed
-        YELLOW → approval exists and matches? → else create approval, suspend
-        RED    → DENY always
-  10. Idempotency key already executed?      → return prior result, DO NOT re-execute
-                  ↓
-              EXECUTE → log outcome
+
+  authorize() — decides, executes nothing
+   0. Request well-formed?                    → DENY  INVALID_REQUEST
+   1. Global freeze active (any class)?       → DENY  GLOBAL_FREEZE
+   2. Agent exists?                           → DENY  UNKNOWN_AGENT
+      Agent definition well-formed?           → DENY  INVALID_AGENT
+   3. Agent frozen?                           → DENY  AGENT_FROZEN
+      Agent lifecycle state == active?        → DENY  AGENT_NOT_ACTIVE
+   4. Workflow frozen?                        → DENY  WORKFLOW_FROZEN
+   5. Tool registered?                        → DENY  UNKNOWN_TOOL
+   6. Tool on this agent's allowlist?         → DENY  TOOL_NOT_ALLOWED
+   7. Action type known?                      → DENY  UNKNOWN_ACTION (resolves to RED)
+   8. Action tier is RED?                     → DENY  RED_REQUIRES_HUMAN
+   9. Action tier ≤ agent clearance?          → DENY  CLEARANCE_INSUFFICIENT
+  10. Scope constraints satisfied?            → DENY  SCOPE_VIOLATION
+  11. Budget exists at every level?           → DENY  BUDGET_MISSING
+  12. Budget sufficient at every level?       → DENY  BUDGET_EXCEEDED
+  13. Tier gate
+        GREEN  → ALLOW
+        YELLOW → resolve approval:
+                   no approval          → NEEDS_APPROVAL  APPROVAL_MISSING
+                   malformed            → DENY  INVALID_APPROVAL
+                   wrong action/payload → DENY  APPROVAL_MISMATCH
+                   pending or rejected  → DENY  APPROVAL_NOT_GRANTED
+                   expired              → DENY  APPROVAL_EXPIRED
+                 then, on a granted approval:
+                   hash(execution payload) ≠ approved_payload_hash
+                                        → DENY  APPROVAL_PAYLOAD_MISMATCH
+                   rendered_description ≠ render(execution payload)
+                                        → DENY  APPROVAL_DESCRIPTION_MISMATCH
+                   approved payload out of scope
+                                        → DENY  SCOPE_VIOLATION
+                                        → otherwise ALLOW
+
+  execute() — runs only on ALLOW
+  14. External action without an idempotency key?
+                                        → DENY  IDEMPOTENCY_KEY_REQUIRED
+  15. Key already claimed and in flight? → DENY  IDEMPOTENCY_IN_FLIGHT
+  16. Key already completed?            → replay prior result, invoke nothing,
+                                          charge nothing
+      otherwise → claim key → INVOKE HANDLER → charge budgets → record result
+                  handler threw?           → HANDLER_ERROR, key recorded failed,
+                                             no budget charged. A retry needs a
+                                             NEW key: a retry is a new attempt
+                                             and the caller must decide it is safe
 ```
+
+**Ordering is deliberate.** A global freeze short-circuits before any budget
+arithmetic. RED is refused before clearance is consulted, because no clearance
+value can make a RED action executable — checking clearance first would leave
+`RED_REQUIRES_HUMAN` reachable only by an agent holding RED clearance, which
+the validator forbids, making it dead code in the enforcement path.
+
+**The two approval integrity checks are independent and both required.** The
+hash proves the bytes did not change after approval; the description proves the
+human read those bytes. With only the first, a hostile payload displayed as a
+polite follow-up executes faithfully.
+
+Every decision is logged, **allow and deny alike**. There is exactly one call
+site in `broker.js` where a handler is invoked, guarded by a single ALLOW
+check. **The agent's prompt is consulted at no point in this sequence.**
 
 Every decision is logged, **allow and deny alike**. Checks are ordered cheapest
 and most absolute first: a global freeze short-circuits before any budget
