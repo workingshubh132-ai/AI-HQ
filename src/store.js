@@ -222,6 +222,16 @@ function buildMemoryStore(seed = {}) {
     chargeBudgets(applicable, cost) {
       for (const b of applicable) b.spent += cost;
     },
+    /**
+     * One budget row, exactly as given, no deduplication. Promoted from
+     * unused introspection to the formal contract in M8: workflow.js needs
+     * to add a task-level row per child task in a tree without
+     * re-creating createTaskBudgets' shared tree-level row a second time.
+     * The caller is responsible for not creating a duplicate.
+     */
+    addBudget(budget) {
+      budgets.push(budget);
+    },
 
     // ── idempotency ───────────────────────────────────────────────────────
     getIdempotency(key) {
@@ -237,13 +247,15 @@ function buildMemoryStore(seed = {}) {
 
     // ── introspection — NOT part of the storage contract ─────────────────
     //
-    // These four exist because they were cheap to write, not because
+    // These three exist because they were cheap to write, not because
     // anything in src/ or tests/ calls them. A future adapter is not
     // required to implement them. Read-only, so unlike putAgent (removed
-    // above) none of them can be used to bypass authorization — but
+    // in M6) none of them can be used to bypass authorization — but
     // relying on any of them from new code should mean adding it to
     // STORAGE_CONTRACT in storage.js first, with a contract test, not
     // reaching for a convenience method a Postgres adapter may not have.
+    // (addBudget was the fourth; it moved above when M8 gave it a real
+    // caller — see DECISIONS.md D25.)
     listAgentVersions(agentId) {
       return [...agentVersions.values()].filter((v) => v.agent_id === agentId);
     },
@@ -252,9 +264,6 @@ function buildMemoryStore(seed = {}) {
     },
     getAgentRecord(slug) {
       return agentRecords.get(slug) ?? null;
-    },
-    addBudget(budget) {
-      budgets.push(budget);
     },
   };
 }

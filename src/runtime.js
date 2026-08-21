@@ -31,6 +31,9 @@ export const TASK_STATUS = Object.freeze({
   RUNNING: 'running',
   COMPLETED: 'completed',
   FAILED: 'failed',
+  CANCELLED: 'cancelled', // added in M8 — a task in a cancelled or
+  // dependency-failed workflow never reaches runTask, so this value is
+  // set by the workflow engine (workflow.js), never by this file.
 });
 
 export const RUNTIME_REASON = Object.freeze({
@@ -80,36 +83,65 @@ export function createRuntime({ store, broker, audit, clock, handlers, registryS
     const now = clock();
     const agent = store.getAgent(agent_slug);
 
-    const signature = taskSignature({
-      agent_slug,
-      action_type: 'agent.run',
-      input,
-    });
+    // M8: an orchestrator (workflow.js) may have already created this task
+    // record at admission time, carrying tree structure this function
+    // knows nothing about — parent_task_id, depends_on, workflow_id,
+    // attempt_number, retry_of_task_id. Re-creating it from scratch here,
+    // as this function always did through M7, would silently discard all
+    // of that. Reuse it instead; only re-derive the facts that are this
+    // function's own job to establish fresh — agent_id and
+    // agent_version_id, on the same "authorization is evaluated at
+    // execution time, not trusted from an earlier snapshot" principle the
+    // pre-flight checks below already apply. A caller that never
+    // pre-creates a task (every M5–M7 caller) is unaffected: this branch
+    // is simply never taken, and the else branch is byte-for-byte what
+    // this function always did.
+    const preExisting = store.getTask(task_id);
+    const signature = preExisting
+      ? preExisting.signature
+      : taskSignature({ agent_slug, action_type: 'agent.run', input });
 
-    let task = store.createTask({
-      id: task_id,
-      parent_task_id: null,
-      tree_id,
-      depth,
-      signature,
-      agent_slug,
-      agent_id: agent?.agent_id ?? null,
-      agent_version_id: agent?.version_id ?? null,
-      required_capability,          // recorded. Routing does not exist yet
-      input,
-      output: null,
-      status: TASK_STATUS.PENDING,
-      created_at: now,
-      started_at: null,
-      completed_at: null,
-      registry_sha: registrySha,
-    });
+    let task = preExisting
+      ? store.updateTask(task_id, {
+          agent_id: agent?.agent_id ?? null,
+          agent_version_id: agent?.version_id ?? null,
+          registry_sha: registrySha,
+        })
+      : store.createTask({
+          id: task_id,
+          parent_task_id: null,
+          tree_id,
+          depth,
+          signature,
+          agent_slug,
+          agent_id: agent?.agent_id ?? null,
+          agent_version_id: agent?.version_id ?? null,
+          required_capability,          // recorded. Routing does not exist yet
+          input,
+          output: null,
+          status: TASK_STATUS.PENDING,
+          created_at: now,
+          started_at: null,
+          completed_at: null,
+          registry_sha: registrySha,
+        });
+
+    // The depth actually admitted (workflow.js validated it against
+    // MAX_DEPTH already) is authoritative once a task record exists;
+    // falls back to the parameter for the pre-M8, no-pre-creation path.
+    const effectiveDepth = task.depth ?? depth;
 
     const fail = (reason, detail) => {
       const updated = store.updateTask(task.id, {
         status: TASK_STATUS.FAILED,
         completed_at: clock(),
         error: detail ?? reason,
+        // `error` above is prose (a detail string when one exists, else the
+        // bare reason) — good for a human, useless for a policy decision.
+        // failure_reason_code is always the exact RUNTIME_REASON, added in
+        // M8 so retry policy (workflow.js) can classify a failure without
+        // parsing free text. Additive: no existing test reads this field.
+        failure_reason_code: reason,
       });
       audit.write({
         event: 'runtime.task',
@@ -138,8 +170,15 @@ export function createRuntime({ store, broker, audit, clock, handlers, registryS
     }
     if (store.activeFreeze('agent', agent_slug, now)) return fail(RUNTIME_REASON.AGENT_FROZEN);
     if (store.activeFreeze('global', null, now)) return fail(RUNTIME_REASON.AGENT_FROZEN, 'global freeze');
+    // The Broker has checked workflow-scoped freeze for tool calls since
+    // Milestone 4 (WORKFLOW_FROZEN). This runtime pre-flight never checked
+    // it for AGENT execution — a gap invisible while every tree was one
+    // task, real now that M8 makes trees real: a frozen workflow could
+    // still run agent logic and spend model budget on tasks that could
+    // never call a tool. Found during M8's inspection; fixed here.
+    if (tree_id && store.activeFreeze('workflow', tree_id, now)) return fail(RUNTIME_REASON.AGENT_FROZEN, 'workflow freeze');
     if (agent.state !== 'active') return fail(RUNTIME_REASON.AGENT_NOT_ACTIVE, `state is ${agent.state}`);
-    if (depth > MAX_DEPTH) return fail(RUNTIME_REASON.DEPTH_EXCEEDED, `depth ${depth} exceeds ${MAX_DEPTH}`);
+    if (effectiveDepth > MAX_DEPTH) return fail(RUNTIME_REASON.DEPTH_EXCEEDED, `depth ${effectiveDepth} exceeds ${MAX_DEPTH}`);
 
     const handler = Object.hasOwn(handlers, agent_slug) ? handlers[agent_slug] : null;
     if (!handler) return fail(RUNTIME_REASON.NO_HANDLER);

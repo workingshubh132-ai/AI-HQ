@@ -562,6 +562,136 @@ it stands and was left untouched.
 
 ---
 
+## D25 — The workflow engine is an orchestrator that reuses runtime.js, never a second execution path
+
+Decided 2026-08-21 (Milestone 8).
+
+`src/workflow.js` turns the single-task runtime into a bounded,
+multi-task, dependency-aware engine. It calls `runtime.runTask()`
+unmodified for every task it runs — there is exactly one execution path
+from "a task exists" to "a handler ran," and the Broker sees exactly the
+same tool calls it always did. Enforced tree limits for the first time
+(`MAX_DEPTH=4`, `MAX_FANOUT=8`, `MAX_TOTAL_NODES=32`, all from
+`limits.js`, none reimplemented) and deterministic loop detection
+(`taskSignature`, also reused, not reimplemented).
+
+**Workflow records live in `workflow.js`'s own closure, not `store.js`.**
+Same call M7 made for model-call budgets: a workflow's state, node count,
+and task ordering are orchestration bookkeeping the Broker never queries
+and no future audit needs as a separately durable entity. `tree_id` IS
+`workflow_id` throughout, which lets the existing tree-level budget
+dimension (already in `store.js`, already tested since M4) serve as the
+workflow's shared spending ceiling with zero new storage primitives.
+
+**Two boundaries, both real, same pattern as D20.** `addTask()` runs the
+full admission gauntlet at proposal time — shape, total-node ceiling,
+depth, fan-out, dependency existence, loop detection, agent/version
+validity, budget — and `runtime.js`'s pre-flight re-checks agent/version
+validity and depth *again*, authoritatively, the moment a task actually
+executes. Neither replaces the other: admission-time checks reject fast
+and audit why; execution-time checks hold even if something about the
+agent changed between admission and execution (paused, frozen, version
+superseded).
+
+**Untrusted model-proposed children get no shortcut.** A completed task's
+envelope may carry `proposed_child_tasks`. `step()` passes every single
+proposal through the *exact same* `addTask()` gauntlet used for
+human-created tasks — a model proposing 20 children gets the first 8
+admitted and the rest explicitly rejected and audited (never silently
+truncated); a model proposing enough children across multiple parents to
+exceed the total-node ceiling is stopped by that ceiling even though each
+individual parent's fan-out was within limit; a model proposing the same
+`(agent, input)` pair twice is stopped by the same loop detector a human
+would be.
+
+**Retries create new task records; they never resurrect the original.**
+`retryTask()` mints a fresh task with `attempt_number` incremented and
+`retry_of_task_id` pointing at the original, bounded by
+`MAX_TASK_RETRY_CEILING = 3` regardless of configuration. Only
+`RETRYABLE_REASONS = {HANDLER_ERROR}` auto-retries; every other failure
+reason — unknown agent, unapproved version, policy violation, malformed
+input, budget — never retries, because retrying a fact that will be
+exactly as true on the second attempt turns one alarming event into a
+tolerated pattern. Retries deliberately bypass loop detection (repeating
+identical work on purpose is the entire point of a retry) but nothing
+else — not the retry ceiling, not the total-node ceiling, not agent
+validity.
+
+**`addBudget` promoted from unused introspection to the formal storage
+contract.** It existed on the in-memory store since M4.5 but had no real
+caller and was explicitly excluded from `STORAGE_CONTRACT` (D23) as
+"cheap to write, not needed." M8 gives it a genuine first caller:
+`workflow.js` needs to add exactly one task-level budget row per child
+task, and one `agent_day` row per agent slug encountered, without
+re-triggering `createTaskBudgets`' tree-level row creation a second time.
+Moved in `store.js` from the "introspection — NOT part of the storage
+contract" block into the formal budgets section; added to
+`STORAGE_CONTRACT` in `storage.js` with the same arity it always had. No
+behavior changed, only where the method is documented to live.
+
+**`failure_reason_code` added to task records.** The pre-existing `error`
+field conflates a prose detail string with the bare reason code once a
+detail exists (`error: detail ?? reason`) — useless for a retry policy
+that needs to classify a failure exactly, not parse free text.
+`failure_reason_code` is always the precise `RUNTIME_REASON`, set
+alongside `error` in `runtime.js`'s `fail()` helper. Purely additive: no
+existing test reads this field, and none needed to change.
+
+**A workflow-freeze gap found during inspection, closed here.**
+`broker.js` has checked `store.activeFreeze('workflow', tree_id, now)`
+for every tool call since Milestone 4. `runtime.js`'s pre-flight — which
+gates *agent execution*, a separate boundary from the Broker's *tool
+execution* gate (see the file's own header, D20) — never checked the
+`'workflow'` freeze scope, only `'agent'` and `'global'`. Invisible while
+every tree was exactly one task; real the moment M8 makes multi-task
+trees real, because a frozen workflow could otherwise still run agent
+logic and spend model budget on tasks that could never successfully call
+a tool. Added: `if (tree_id && store.activeFreeze('workflow', tree_id,
+now)) return fail(...)`, placed alongside the existing agent/global freeze
+checks.
+
+**The one real bug this milestone found: `runtime.js` was silently
+discarding the orchestrator's task record.** Before this fix, every call
+to `runTask()` unconditionally called `store.createTask(...)` — correct
+when `runtime.js` owns task creation (every M5–M7 caller), wrong now that
+`workflow.js` pre-creates a richer record (carrying `depends_on`,
+`workflow_id`, `attempt_number`, `retry_of_task_id`) before calling
+`runTask()`. The unconditional create silently overwrote that record with
+a plain one lacking those fields — surfaced as retries that never
+terminated, because every `retryTask()` call read back `attempt_number:
+undefined` (defaulting to `1`) and computed the same "next attempt: 2"
+forever. Fixed by checking `store.getTask(task_id)` first: if a record
+already exists, `runTask()` reuses it via `updateTask`, re-deriving only
+the facts that are its own job to establish fresh at execution time
+(`agent_id`, `agent_version_id`, `registry_sha`) — the same
+"authorization is evaluated at execution time, not trusted from an
+earlier snapshot" principle its pre-flight checks already apply. If no
+record exists, behavior is byte-for-byte what it always was. Considered
+and rejected the alternative of having `workflow.js` keep a wholly
+separate bookkeeping structure instead of using `store.createTask` at
+all — one source of truth in the store was judged safer than two
+structures that could drift out of sync. Verified with the full 176-test
+pre-M8 suite unchanged, plus a corrected retry trace showing exactly 3
+handler calls and a clean `FAILED` termination.
+
+**The diamond simulation is a reusable fixture, not a one-off demo.**
+`src/demo-workflow.js` wires four deterministic, network-free,
+credential-free agents into `research → {analysis, validation} → final`,
+where `final` depends on both branches — the smallest shape that
+exercises fan-out and convergence in the same workflow. Exported for
+future milestones' tests to import directly, the same role
+`demo-agent.js` has played since M5.
+
+**What is not built here.** No CEO, no Guardian, no capability-based
+routing, no real external tool, no real model provider, no real network
+access, no Supabase connection, no production credential. `step()` is
+synchronous and non-preemptible: "cancel" means "prevent not-yet-started
+work from starting," not "interrupt work in progress" — honest given
+nothing in this codebase is asynchronous yet, not a limitation hidden
+behind the word "cancel."
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

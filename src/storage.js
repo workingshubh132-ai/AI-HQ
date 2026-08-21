@@ -23,9 +23,12 @@
  * remains the Broker's job, unconditionally.
  *
  * The contract below covers exactly the methods actually called from
- * src/ or tests/ today. Four methods that exist on the in-memory store —
- * listAgentVersions, listTasks, getAgentRecord, and one that was removed
- * outright — are deliberately excluded; see DECISIONS.md D23.
+ * src/ or tests/ today. Three methods that exist on the in-memory store —
+ * listAgentVersions, listTasks, getAgentRecord — are deliberately
+ * excluded as unused introspection; a fourth, putAgent, was removed
+ * outright as a latent authorization bypass. See DECISIONS.md D23.
+ * addBudget was excluded for the same reason until M8 gave it a real
+ * caller; see D25.
  *
  * Constitution: sections 6, 7, 25 (agents as data; version immutability).
  */
@@ -66,6 +69,10 @@ export const STORAGE_CONTRACT = Object.freeze({
   // ── budgets ────────────────────────────────────────────────────────────
   budgetsFor: 1, // ({task_id, tree_id, agent_slug}) -> budget[]
   createTaskBudgets: 1, // ({task_id, tree_id, agent_slug, limit}) -> budget[]
+  addBudget: 1, // ({level, target_id, limit, spent}) -> void. One row, no
+  // dedup — the caller's job. First real caller: workflow.js (M8), which
+  // needs to add exactly one task-level row per child task without
+  // re-creating the shared tree-level row createTaskBudgets would.
   chargeBudgets: 2, // (applicable, cost) -> void. Called only after real execution.
 
   // ── idempotency ────────────────────────────────────────────────────────
