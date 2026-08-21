@@ -9,6 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node scripts/check-env.mjs"
+    "check": "node scripts/check-env.mjs",
+    "test": "node --test tests/*.test.js"
   }
 }

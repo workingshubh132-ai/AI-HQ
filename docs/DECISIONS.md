@@ -214,6 +214,75 @@ this wrong is a legal and reputational problem, not a technical one.
 
 ---
 
+## D14 — Revenue Intelligence is a GREEN agent (future scope)
+
+Decided 2026-08-21. **Not built. Recorded so it is built correctly.**
+
+`revenue-intelligence` will be a discovery, research and scoring agent with
+**GREEN clearance**.
+
+**It may:** discover opportunities · research public information · analyze
+demand and competition · estimate economics · recommend experiments.
+
+**It must not:** contact prospects · spend money · purchase paid APIs ·
+publish externally · perform financial actions.
+
+**Why it matters:** every prohibition above is enforced by its GREEN
+clearance, not by its prompt. Contacting, spending, and publishing are
+YELLOW or RED action types, and the Broker refuses them before any
+handler is reached. The restriction is arithmetic, not instruction.
+
+Two things to settle when it is built:
+
+- **"Continuously discover" is a runaway-workflow risk.** Continuous means
+  unbounded. It must run on a schedule with a per-run budget, not a loop.
+- **Paid research data is YELLOW plus a budget line**, not a quiet
+  upgrade. It stays fully GREEN only while its tools are free and
+  read-only.
+
+That this agent requires no new security architecture is the test of
+whether the Broker was designed correctly.
+
+---
+
+## D15 — RED is refused before clearance is considered
+
+Decided 2026-08-21, during implementation. **Deviates from the approved
+Milestone 4 plan**, which had test 5 expecting `CLEARANCE_INSUFFICIENT`.
+
+The Broker checks `tier === RED` *before* comparing tier to agent
+clearance, so any agent attempting a RED action is refused with
+`RED_REQUIRES_HUMAN` regardless of its clearance.
+
+**Why it matters:** RED is human-only by definition, so no clearance value
+can make it executable. Checking clearance first would mean
+`RED_REQUIRES_HUMAN` could only fire for a RED-cleared agent — and agents
+may not hold RED clearance at all, making that branch dead code. Dead code
+in an enforcement path is a liability.
+
+The Broker also rejects any agent definition claiming RED clearance as
+malformed.
+
+Mutation testing confirmed both barriers are independent: removing the RED
+gate alone still leaves clearance blocking the action.
+
+---
+
+## D16 — Scope is re-checked against the human-approved payload
+
+Decided 2026-08-21, during implementation. Found while writing tests.
+
+When a human edits a proposed action before approving it, the Broker
+re-runs the tool's scope check against the **edited** payload, not only the
+agent's original.
+
+**Why it matters:** without this, an edit could move an action outside the
+tool's declared bounds — a different recipient domain, say — and execute
+unchecked. The human is the authority, but a typo is not an instruction.
+This is the last point before a side effect where the mistake is catchable.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
