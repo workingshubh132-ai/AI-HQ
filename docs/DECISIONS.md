@@ -880,6 +880,112 @@ lines anywhere else.
 
 ---
 
+## D28 — Durable persistence is real and tested, deliberately not yet live
+
+Decided 2026-08-21 (Milestone 11).
+
+`src/postgres-store.js` is a genuine, working Postgres implementation of
+every method `store.js` implements, proven against the *exact same*
+assertions in `tests/storage-contract.test.js` — the shared harness that
+has said "a future Postgres/Supabase adapter later, with no change to
+this file beyond adding a second call at the bottom" since M6. That
+promise held: the file gained one `beforeEach` parameter (a no-op for the
+in-memory store) and one more call at the bottom. It is genuinely tested
+against a real, local PostgreSQL 16 instance, including the two
+properties the in-memory store's own header admits it cannot prove:
+concurrency-safe idempotency (25 truly parallel `claimIdempotency` calls
+for one key, proven to produce exactly one winner) and `updateTask`'s
+row-locked read-modify-write (two concurrent patches to different fields
+of the same task, proven that neither is lost).
+
+**The one deliberate, load-bearing limitation: this is not wired into the
+live system.** `broker.js`, `runtime.js`, `workflow.js`, `router.js`, and
+`guardian.js` all call `store.<method>()` and `audit.write(...)`
+synchronously and use the return value directly — zero `await` anywhere
+in any of them, correct for the in-memory store they were built and
+tested against, which does no real I/O. A real network call to Postgres
+cannot be synchronous in Node.js; every method on the Postgres adapter
+necessarily returns a Promise. Making it the live store would mean adding
+`await` at every single call site across the entire security core —
+touching precisely the files this project has repeatedly said not to
+modify casually, for a change with a blast radius far larger than "add
+persistence" implies. That rewrite is not started here, is not silently
+implied by "the adapter exists," and is named as its own future
+milestone rather than attempted at the end of this one under time
+pressure. The M11 directive's own fallback — "build and fully test the
+adapter locally" when a live credential boundary isn't the actual next
+step — is exactly what this is.
+
+**The schema had to be rebuilt, not incrementally altered.** Migrations
+0001/0002 modeled the v0.1 skeleton from Milestone 2, before the
+agents/agent_versions split (M5), the workflow/task-tree engine (M8),
+budgets, freezes, or idempotency existed. Neither had ever run against a
+real database (0002's own header: "table contains zero rows"). Migration
+0003 drops and recreates every table rather than pretending an ALTER
+path onto a schema that was never live — the honest operation for a
+design that was superseded by seven milestones of real implementation
+before it was ever deployed. Two real integrity bugs were found and
+fixed during this rebuild, before they ever reached production: a
+foreign key from `agent_versions.agent_id` to `agents.id` would have
+rejected the exact "add the version before the agent record exists yet"
+ordering every real call site in this codebase uses (confirmed by
+`git grep` across every test and demo-agent file, not assumed); the same
+was true for `tasks.agent_version_id`, which `runtime.js` populates
+*before* its own pre-flight checks reject an unresolvable version. Both
+constraints were removed, with the reasoning recorded in the migration
+file itself, not silently dropped.
+
+**`pg` is the first runtime dependency this project has ever taken.**
+Zero dependencies was correct for ten milestones that did no real I/O.
+Speaking the Postgres wire protocol from Node.js without it is not a
+serious option. `pg` is the de facto standard client, minimal in its own
+dependency tree (`pg-connection-string`, `pg-pool`, `pg-protocol`,
+`pg-types`; `pg-native` is an unmet *optional* dependency, correctly
+never installed). Added for exactly the purpose that made it
+unavoidable, not preemptively.
+
+**`AI_HQ_DATABASE_URL` and `AI_HQ_TEST_DATABASE_URL` are deliberately
+separate variables.** The test suite creates and drops databases and
+truncates tables freely — exactly the behavior that must never be
+possible against a real, configured project by accident. No code path in
+this repository reads `AI_HQ_DATABASE_URL`; nothing but a human running
+`npm run migrate` does. `.env` remains untracked (`.gitignore` already
+covered it); no real connection string was ever written to a committed
+file. All testing in this milestone ran against a local, disposable
+PostgreSQL 16 instance with a role granted `CREATEDB` for test isolation
+only — a grant this repository's own `.env.example` never suggests
+applying to a real deployment's credential.
+
+**A genuine concurrency bug was found in the test suite itself, not in
+the adapter.** `node:test` runs separate test *files* concurrently by
+default. `tests/storage-contract.test.js`'s Postgres block and
+`tests/postgres-store.test.js` both originally pointed at the same
+`AI_HQ_TEST_DATABASE_URL` database directly — truncating and asserting
+row counts while the other file's tests ran at the same time against the
+same tables, producing real, intermittent cross-file failures the first
+full-suite run surfaced immediately. Fixed with
+`tests/helpers/pg-test-db.mjs`: each file that needs a live, mutable
+database creates and migrates its own uniquely-named one at load time
+and drops it afterward — the same isolation a real CI matrix job would
+have, not achieved by serializing the whole suite (which would have
+slowed down every future Postgres-backed test file for everyone, in
+exchange for a problem that was actually about resource sharing, not
+about needing to run one test at a time).
+
+**Migration runner, health check, and startup validation are real and
+independently tested.** `scripts/migrate.mjs` tracks applied files in a
+`schema_migrations` table it creates itself (never relying on a
+migration file to bootstrap its own tracking, which no migration file
+here does), applies pending files in filename order inside a transaction
+each, and is idempotent. `checkPersistenceHealth` and `validateStartup`
+(`postgres-store.js`) never throw — a health check able to crash the
+process it protects would be worse than none — and `validateStartup`
+names the *specific* migration file missing rather than a generic
+connection failure, tested against a genuinely unmigrated fresh database,
+not a mock.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
