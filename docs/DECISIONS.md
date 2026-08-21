@@ -379,6 +379,62 @@ A granted approval with no `rendered_description` fails closed.
 
 ---
 
+## D20 — Two execution boundaries, not one
+
+Decided 2026-08-21 (Milestone 5).
+
+The **Broker gates tool calls. The runtime gates agent execution.** Both
+must hold.
+
+**Why a second boundary exists:** the Broker never sees an agent being
+invoked — it only sees requests for tools. A handler that computes without
+calling a tool would run even for a paused agent or an unapproved version,
+because nothing was ever asked of the Broker for it to refuse. The runtime
+therefore performs its own pre-flight: agent resolvable, version approved,
+lifecycle active, not frozen, budget present, input contract satisfied.
+
+**This is not authorization moving out of the Broker.** Every tool call
+still goes through it unchanged, and the runtime cannot permit anything the
+Broker would refuse. The overlap is deliberate defence in depth.
+
+Mutation-tested in three configurations: removing the Broker check alone
+fails one test, removing the runtime check alone fails a different one, and
+removing both allows a version that no human ever approved to execute and
+produce output.
+
+---
+
+## D21 — `model_config` must be empty until a provider is approved
+
+Decided 2026-08-21 (Milestone 5).
+
+The validator rejects any agent version declaring a non-empty
+`model_config`.
+
+**Why it matters:** no model provider exists, is budgeted, or is reviewed. A
+version naming one is either a mistake or an attempt to reach capability
+that has not been approved. Failing closed at definition time is cheaper
+than discovering it at runtime, and it means Milestone 5.3 must explicitly
+relax this rule rather than silently inherit permission.
+
+---
+
+## D22 — The agent resolver keeps the Broker version-blind
+
+Decided 2026-08-21 (Milestone 5).
+
+`store.getAgent(slug)` returns a **resolved** flat view — runtime state
+merged with the active version's security fields — so `broker.js` never
+learns that versions exist.
+
+**Why it matters:** it kept the enforcement boundary almost untouched while
+adding the whole agent model. One check was added and nothing else changed,
+so all 73 prior tests passed unmodified. A Broker that had to understand
+version storage would have doubled in size and carried real regression risk
+for no security benefit.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

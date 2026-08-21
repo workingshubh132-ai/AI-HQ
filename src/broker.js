@@ -33,6 +33,7 @@ export const REASON = Object.freeze({
   GLOBAL_FREEZE: 'GLOBAL_FREEZE',
   UNKNOWN_AGENT: 'UNKNOWN_AGENT',
   INVALID_AGENT: 'INVALID_AGENT',
+  VERSION_NOT_APPROVED: 'VERSION_NOT_APPROVED',
   AGENT_FROZEN: 'AGENT_FROZEN',
   AGENT_NOT_ACTIVE: 'AGENT_NOT_ACTIVE',
   WORKFLOW_FROZEN: 'WORKFLOW_FROZEN',
@@ -221,6 +222,17 @@ export function createBroker({ tools, store, audit, clock }) {
     if (!agent) return settle(DECISION.DENY, REASON.UNKNOWN_AGENT);
     const agentInvalid = validateAgent(agent);
     if (agentInvalid) return settle(DECISION.DENY, REASON.INVALID_AGENT, agentInvalid);
+
+    // 2b — the active version must be human-approved.
+    //
+    // Without this, an agent pointing at a draft version would execute with
+    // that version's clearance and tools, and human version approval would
+    // become advisory. Fail closed: a missing or unrecognised version_state
+    // is not approval.
+    if (agent.version_state !== 'approved') {
+      return settle(DECISION.DENY, REASON.VERSION_NOT_APPROVED,
+        `active version is ${agent.version_state ?? 'unresolved'}`);
+    }
 
     // 3 — agent freeze and lifecycle state
     if (store.activeFreeze('agent', agent.slug, now)) {

@@ -19,24 +19,32 @@ export const AGENTS = Object.freeze({
   green: {
     slug: 'green-agent',
     clearance: 'GREEN',
+    version_id: 'fixture@1.0.0',
+    version_state: 'approved',
     state: 'active',
     allowed_tools: ['text.wordcount', 'lead.score', 'fake.send_message', 'fake.transfer_funds'],
   },
   yellow: {
     slug: 'yellow-agent',
     clearance: 'YELLOW',
+    version_id: 'fixture@1.0.0',
+    version_state: 'approved',
     state: 'active',
     allowed_tools: ['text.wordcount', 'fake.send_message', 'fake.transfer_funds'],
   },
   restricted: {
     slug: 'restricted-agent',
     clearance: 'YELLOW',
+    version_id: 'fixture@1.0.0',
+    version_state: 'approved',
     state: 'active',
     allowed_tools: ['text.wordcount'],
   },
   paused: {
     slug: 'paused-agent',
     clearance: 'YELLOW',
+    version_id: 'fixture@1.0.0',
+    version_state: 'approved',
     state: 'paused',
     allowed_tools: ['text.wordcount', 'fake.send_message'],
   },
@@ -140,4 +148,80 @@ export function approval(o = {}) {
 /** A payload the fake message tool will accept. */
 export function messagePayload(o = {}) {
   return { recipient_domain: 'approved-client.example', body: 'proposal', ...o };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Milestone 5 — runtime fixtures
+// ─────────────────────────────────────────────────────────────────────────
+
+import { createRuntime } from '../src/runtime.js';
+import { VERSION_STATE, RUNTIME_STATE } from '../src/agents.js';
+import {
+  demoAgentVersion, demoAgentRecord, DEMO_AGENT_SLUG, DEMO_VERSION_ID, DEMO_HANDLERS,
+} from '../src/demo-agent.js';
+
+export { DEMO_AGENT_SLUG, DEMO_VERSION_ID, VERSION_STATE, RUNTIME_STATE };
+export const REGISTRY_SHA = 'test-registry-sha';
+export const RUN_TASK = 'task-1';
+export const RUN_TREE = 'tree-1';
+
+/**
+ * A complete runtime with the demo agent registered and approved.
+ *
+ * @param {object} [o]
+ * @param {string} [o.versionState]    default approved
+ * @param {string} [o.lifecycleState]  default active
+ * @param {boolean} [o.withBudget]     default true
+ * @param {object[]} [o.freezes]
+ * @param {object} [o.handlers]        override the demo handler
+ * @param {object} [o.version]         override version fields
+ */
+export function runtimeSetup(o = {}) {
+  const { tools, outbox, invocations } = createTools();
+  let time = o.now ?? T0;
+  const clock = () => time;
+
+  const store = createMemoryStore({ freezes: o.freezes ?? [] });
+  const audit = createAuditSink();
+  const broker = createBroker({ tools, store, audit, clock });
+
+  const version = demoAgentVersion({
+    state: o.versionState ?? VERSION_STATE.APPROVED,
+    approved_by: 'founder',
+    approved_at: T0 - 100,
+    now: T0 - 200,
+    ...(o.version ?? {}),
+  });
+  store.addAgentVersion(version);
+  store.registerAgent(demoAgentRecord({
+    lifecycle_state: o.lifecycleState ?? RUNTIME_STATE.ACTIVE,
+    active_version_id: o.activeVersionId === undefined ? DEMO_VERSION_ID : o.activeVersionId,
+    now: T0 - 200,
+  }));
+
+  if (o.withBudget !== false) {
+    store.createTaskBudgets({ task_id: RUN_TASK, tree_id: RUN_TREE, agent_slug: DEMO_AGENT_SLUG, limit: 100 });
+  }
+
+  const runtime = createRuntime({
+    store, broker, audit, clock,
+    handlers: o.handlers ?? DEMO_HANDLERS,
+    registrySha: REGISTRY_SHA,
+  });
+
+  return {
+    runtime, broker, store, audit, outbox, invocations, tools, version,
+    setTime: (t) => { time = t; },
+  };
+}
+
+/** A standard task request for the demo agent. */
+export function runRequest(o = {}) {
+  return {
+    agent_slug: DEMO_AGENT_SLUG,
+    input: { text: 'hello world from ai hq' },
+    task_id: RUN_TASK,
+    tree_id: RUN_TREE,
+    ...o,
+  };
 }
