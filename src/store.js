@@ -1,8 +1,15 @@
 /**
  * IN-MEMORY STORE
  *
- * Holds every piece of state the Broker consults: agents, approvals,
- * freezes, budgets and idempotency records.
+ * The reference implementation of the storage contract defined in
+ * storage.js. Holds every piece of state the Broker consults: agents,
+ * approvals, freezes, budgets and idempotency records.
+ *
+ * Process-local, non-durable — everything here is lost on exit. A future
+ * Postgres/Supabase adapter implements the same contract and can replace
+ * this file without any change to broker.js, runtime.js, or validator.js,
+ * because none of them import this file directly; they only call methods
+ * on whatever `store` object they were handed. See DECISIONS.md D23.
  *
  * ⚠️  CONCURRENCY LIMITATION — READ THIS BEFORE TRUSTING IDEMPOTENCY
  *
@@ -21,6 +28,7 @@
  */
 
 import { resolveAgent } from './agents.js';
+import { assertStorageContract } from './storage.js';
 
 /** @typedef {'agent'|'workflow'|'ai_ceo'|'global'} FreezeScope */
 /** @typedef {'soft'|'hard'} FreezeClass */
@@ -33,6 +41,22 @@ import { resolveAgent } from './agents.js';
  * @param {object[]} [seed.budgets]
  */
 export function createMemoryStore(seed = {}) {
+  return finish(buildMemoryStore(seed));
+}
+
+/**
+ * Self-check against the formal contract before the object leaves this
+ * function. If a method is renamed or removed here without updating
+ * storage.js, this throws immediately at construction — the cheapest
+ * possible regression test for the contract, running on every single
+ * call site that creates a store, including every test in this suite.
+ */
+function finish(store) {
+  assertStorageContract(store, 'createMemoryStore()');
+  return store;
+}
+
+function buildMemoryStore(seed = {}) {
   const agents = new Map((seed.agents ?? []).map((a) => [a.slug, a]));
   const approvals = [...(seed.approvals ?? [])];
   const freezes = [...(seed.freezes ?? [])];
@@ -48,11 +72,19 @@ export function createMemoryStore(seed = {}) {
 
   return {
     // ── agents ────────────────────────────────────────────────────────────
+    //
+    // No direct write method exists here. The only way an entry reaches
+    // `agents` (the flat, resolved view the Broker reads) is through
+    // registerAgent / setActiveVersion / setLifecycleState below, all of
+    // which go through resolveAgent(). A prior version of this file
+    // exposed putAgent(), a direct write that bypassed resolution entirely
+    // — nothing called it, but had something called it, it could have
+    // inserted a flat agent object with version_state hardcoded to
+    // 'approved', skipping the human-approval path the Broker's
+    // VERSION_NOT_APPROVED check exists to enforce. Removed rather than
+    // formalized into the contract. See DECISIONS.md D23.
     getAgent(slug) {
       return agents.get(slug) ?? null;
-    },
-    putAgent(agent) {
-      agents.set(agent.slug, agent);
     },
 
     // ── agent versions (IMMUTABLE) ────────────────────────────────────────
@@ -73,9 +105,6 @@ export function createMemoryStore(seed = {}) {
     getAgentVersion(versionId) {
       return agentVersions.get(versionId) ?? null;
     },
-    listAgentVersions(agentId) {
-      return [...agentVersions.values()].filter((v) => v.agent_id === agentId);
-    },
 
     // ── agent records ─────────────────────────────────────────────────────
     /**
@@ -90,9 +119,6 @@ export function createMemoryStore(seed = {}) {
         : null;
       agents.set(agentRecord.slug, resolveAgent(agentRecord, version));
       return agentRecord;
-    },
-    getAgentRecord(slug) {
-      return agentRecords.get(slug) ?? null;
     },
     /** Pointing an agent at a version. Only a human should call this path. */
     setActiveVersion(slug, versionIdValue) {
@@ -127,9 +153,6 @@ export function createMemoryStore(seed = {}) {
       const updated = { ...existing, ...patch };
       tasks.set(id, updated);
       return updated;
-    },
-    listTasks() {
-      return [...tasks.values()];
     },
 
     // ── approvals ─────────────────────────────────────────────────────────
@@ -178,9 +201,6 @@ export function createMemoryStore(seed = {}) {
         return false;
       });
     },
-    addBudget(budget) {
-      budgets.push(budget);
-    },
     /**
      * Creates the four budget levels a task needs before it can run.
      * Without these the Broker denies with BUDGET_MISSING, which is the
@@ -213,6 +233,28 @@ export function createMemoryStore(seed = {}) {
     },
     recordIdempotency(key, record) {
       idempotency.set(key, record);
+    },
+
+    // ── introspection — NOT part of the storage contract ─────────────────
+    //
+    // These four exist because they were cheap to write, not because
+    // anything in src/ or tests/ calls them. A future adapter is not
+    // required to implement them. Read-only, so unlike putAgent (removed
+    // above) none of them can be used to bypass authorization — but
+    // relying on any of them from new code should mean adding it to
+    // STORAGE_CONTRACT in storage.js first, with a contract test, not
+    // reaching for a convenience method a Postgres adapter may not have.
+    listAgentVersions(agentId) {
+      return [...agentVersions.values()].filter((v) => v.agent_id === agentId);
+    },
+    listTasks() {
+      return [...tasks.values()];
+    },
+    getAgentRecord(slug) {
+      return agentRecords.get(slug) ?? null;
+    },
+    addBudget(budget) {
+      budgets.push(budget);
     },
   };
 }

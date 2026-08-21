@@ -435,6 +435,59 @@ for no security benefit.
 
 ---
 
+## D23 — Storage is a formal, tested contract; persistence is a separate decision
+
+Decided 2026-08-21 (Milestone 6).
+
+`src/storage.js` defines `STORAGE_CONTRACT` — the 19 methods actually
+called from `src/` or `tests/` — and a structural checker,
+`assertStorageContract()`. `createMemoryStore()` self-checks against it
+before returning, so a method renamed or removed there without updating
+the contract throws immediately at construction, not somewhere downstream
+in the Broker.
+
+`tests/storage-contract.test.js` is written as a reusable function,
+`runStorageContractTests(label, createStore)`, run once today against
+`createMemoryStore`. A future Postgres/Supabase adapter is exercised by
+calling the same function against its factory — no test is rewritten, one
+call is added.
+
+**What this milestone explicitly does NOT do:** connect to a real
+database. No project was created, no credential exists, no network call
+was added, no dependency was installed. `createMemoryStore` remains the
+only implementation and remains process-local and non-durable — state is
+lost on exit, exactly as before. Pointing a real Postgres/Supabase
+adapter at this contract is a separate decision requiring explicit
+authorization: it introduces the project's first credential and its
+first outbound network call, neither of which existed before and both of
+which cross a boundary this contract does not.
+
+**A finding surfaced while writing the contract.** `store.js` exposed
+`putAgent(agent)` — a direct write into the flat `agents` map the Broker
+reads clearance and tool access from, with no `resolveAgent()` step.
+Nothing called it. Had something called it with a hand-built object
+(`{clearance: 'RED', version_state: 'approved'}`), the Broker would have
+trusted it completely, because the Broker never learns that version
+storage exists — that is the whole point of D22. Removed rather than
+formalized into the contract, and guarded by a regression test so it
+cannot return unnoticed.
+
+Three other unused methods — `listAgentVersions`, `listTasks`,
+`getAgentRecord` — were read-only and posed no equivalent risk, so they
+were left in place as documented non-contract introspection helpers
+rather than removed. `addBudget` joins them for the same reason: nothing
+calls it, but as a write it is structurally identical in risk to
+`createTaskBudgets`, which is in the contract — it grants spending
+capacity, not authorization.
+
+**Why it matters:** the storage layer must never become an authorization
+bypass (Constitution §13, §15). Formalizing the contract was the moment
+that risk became visible, because writing down "what the Broker actually
+needs from storage" made "what storage additionally, silently exposes"
+visible by contrast.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
