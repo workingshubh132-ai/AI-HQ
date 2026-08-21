@@ -453,10 +453,10 @@ Recorded so they are decided deliberately rather than by accident.
 
 | Question | Decide by |
 | --- | --- |
-| Numeric thresholds for soft-freeze triggers and cooling period | First Guardian implementation |
+| ~~Numeric thresholds for soft-freeze triggers and cooling period~~ | Decided M10 — see DECISIONS.md D27 (`GUARDIAN_POLICY`) |
 | Approval staleness — does a 6-day-old proposal need re-confirmation? | v0.2, computable from `created_at` |
 | Concrete budget figures against the ₹1,000–2,000/month ceiling | Before the first paid API call |
-| Where the freeze record lives — new table or agent/task columns | Guardian milestone; requires §23 justification |
+| Where the freeze record lives — new table or agent/task columns | M11 durable persistence; requires §23 justification. Still an in-memory array today; Guardian (M10) reuses it unchanged |
 | Approval queue maximum — the actual number | Approval mechanism milestone |
 
 ---

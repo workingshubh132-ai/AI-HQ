@@ -791,6 +791,95 @@ model provider, no real network access, no production credential.
 
 ---
 
+## D27 — Guardian: an automated caller of a freeze primitive that already existed
+
+Decided 2026-08-21 (Milestone 10).
+
+`src/guardian.js` observes and freezes. It never authorizes. Its entire
+write surface is one call — `store.addFreeze(...)` — the exact primitive
+the Broker (M4), runtime.js (M8), and router.js (M9) already check via
+`store.activeFreeze(...)`. Before this milestone, `addFreeze` had never
+been called from `src/` at all — only from tests. Guardian is the first
+real caller of an enforcement point that has existed since the beginning;
+it does not add a new one.
+
+**Structurally incapable of granting authority, not just instructed not
+to.** `createGuardian({ store, audit, clock, policy })` holds no
+reference to the Broker, runtime.js, workflow.js, or router.js. It cannot
+call a tool, execute a task, approve a version, raise a budget limit, or
+change clearance/allowed_tools — there is no code path by which it could,
+the same "isolation by construction, not convention" property M7
+established for the model boundary (D24) and M9 established for the
+router (D26). Test 213 sweeps the source for every store mutation method
+belonging to another boundary (`setActiveVersion`, `registerAgent`,
+`addApproval`, `chargeBudgets`, `addAgentVersion`, `setLifecycleState`,
+`createTask`, `updateTask`, the idempotency writers) and asserts none of
+them appear — only `addFreeze` does.
+
+**Guardian cannot lift what it freezes, and that is not an oversight.**
+There is no "remove freeze" method on the storage contract for Guardian
+to call even if it wanted to — freezes are append-only. A soft freeze
+self-expires via `expires_at`; a hard freeze (global budget exhaustion —
+the one condition serious enough to be called a "global emergency" in
+the M10 directive) carries none, exactly matching store.js's own
+long-standing freeze comment: "hard freezes... human release only."
+Guardian imposing a freeze and Guardian removing one were never meant to
+be symmetric powers, and test 219 confirms the returned object exposes
+no method — `liftFreeze`, `unfreeze`, `approve`, `execute` — that could
+make them so.
+
+**Six deterministic, threshold-counting policies, no ML, no LLM, no
+wall-clock window.** Every check filters the audit log for a fixed event
+type, takes the most recent `N` matching records (a bounded recent
+window over observed events, not a real-time window this system has no
+background clock to measure), and compares a count against a named
+constant in `GUARDIAN_POLICY`: agent failure rate, workflow failure rate,
+repeated authorization denials, retry spikes, global budget exhaustion,
+and per-agent spending warnings. This is the moment
+OPERATING_MODEL.md's open-questions table named for deciding these
+numbers ("Numeric thresholds for soft-freeze triggers and cooling
+period | First Guardian implementation") — `AGENT_FAILURE_THRESHOLD:
+3` of `AGENT_FAILURE_WINDOW: 5`, `SOFT_FREEZE_COOLDOWN_MS: 15 minutes`,
+and the rest are recorded as placeholders chosen for a working first
+implementation, explicitly not tuned against real traffic that does not
+exist yet. Mutation-tested individually: disabling any one of the six
+threshold comparisons, or the idempotency guard inside `impose()`, each
+produces its own distinct, specific test failures — not one shared
+symptom.
+
+**Evidence is the existing audit log, not a new observation channel.**
+Guardian requires zero new instrumentation anywhere else in the
+codebase — `runtime.task`, `broker.decision`, and `workflow.retry` audit
+events, plus the existing `agent_day`/`global_month` budget rows, already
+carried everything every policy needs. It discovers which workflows to
+check by scanning `tree_id`/`workflow_id` fields already present on audit
+records, because (per D25) workflow records live in workflow.js's own
+closure and Guardian was deliberately not given a reference to the
+workflow engine to query them directly — one less coupling, one less way
+Guardian's reach could quietly grow.
+
+**Idempotent by construction, not by convention.** `impose()` checks
+`store.activeFreeze` before adding a new freeze row; a condition that is
+still breaching an already-frozen scope is recorded as
+`guardian.condition_persists`, not as a second freeze. Without this,
+calling `evaluate()` repeatedly (its natural usage pattern, since nothing
+in this codebase runs it on a real timer) would silently accumulate
+duplicate freeze rows — harmless to `activeFreeze`'s `.find()`
+semantics, but audit noise masquerading as new incidents. Mutation-tested
+directly: removing the guard makes test 208 fail.
+
+**What this milestone deliberately does not do.** `setAgentHealth()`
+(M9, router.js) remains a manual, human-directed API — Guardian was not
+wired to call it, preserving D26's own statement that it is "not wired
+to any automatic trigger." No alerting, no health summaries, no reports
+(M28 territory). No new storage primitive, no schema change, no
+dependency. `broker.js`, `validator.js`, `runtime.js`, `router.js`, and
+`workflow.js` are byte-for-byte untouched by this milestone — the
+cleanest diff of any milestone so far: two new files, zero modified
+lines anywhere else.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
