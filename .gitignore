@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────────────────────
+# AI-HQ .gitignore
+#
+# Files listed here are NEVER uploaded to GitHub.
+# The most important line in this file is ".env" — that is where
+# real passwords and API keys live. It must never leave your machine.
+# ─────────────────────────────────────────────────────────────
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Installed packages (re-created by "npm install", huge, never committed)
+node_modules/
+
+# Compiled output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Test coverage reports
+coverage/
+
+# Editor settings
+.vscode/
+.idea/
+
+# Operating-system junk files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Supabase local working files
+.supabase/
+
+# Temporary files
+.cache/
+*.tmp

@@ -1,0 +1,14 @@
+{
+  "name": "ai-hq",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "An AI-operated business operating system. The human founder is CEO and holds final authority.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node scripts/check-env.mjs"
+  }
+}
