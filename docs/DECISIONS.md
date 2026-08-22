@@ -1186,6 +1186,117 @@ not touch `broker.js`, `validator.js`, `runtime.js`, `router.js`, or
 
 ---
 
+## D31 — The execution coordinator: closing the router gap without rewriting workflow.js
+
+Decided 2026-08-22 (Milestone 14).
+
+`src/execution-coordinator.js` is the caller router.js's own M9 header
+predicted and named as missing: something that calls `router.route()`
+before a task is admitted. Before this milestone, `workflow.js`'s
+`addTask()` took an explicit, caller-supplied `agent_slug` and nothing in
+`src/` ever consulted the router first. The coordinator adds exactly
+three functions — `proposeTask()` (resolve a capability to an agent via
+the unmodified router, then admit via the unmodified `workflow.addTask()`),
+`runStep()` (the unmodified `workflow.step()`, then router reservation
+cleanup, then `guardian.evaluate()`), `runToCompletion()` (repeats
+`runStep()`, mirroring `workflow.js`'s own). `workflow.js`, `router.js`,
+`guardian.js`, and `runtime.js` are byte-for-byte unchanged.
+
+**A completed workflow cannot accept a later proposal — this drove the
+demo's shape, not a bug.** `addTask()`'s `RUNNABLE_STATES` excludes
+`COMPLETED`, by design: once every currently-admitted task in a tree
+drains with no failures, that workflow is done, permanently. This meant
+the natural-looking pattern "propose research, run it, read its real
+output, THEN propose analysis with that data as input" cannot work
+against unmodified `workflow.js` — the workflow reaches `COMPLETED` the
+instant research finishes (nothing else was ever admitted), and `addTask`
+refuses everything after that with `WORKFLOW_NOT_RUNNABLE`. The M14 demo
+pipeline (`src/demo-pipeline-agents.js`, `tests/execution-coordinator.test.js`)
+therefore admits the full diamond shape upfront, all four
+`coordinator.proposeTask()` calls router-resolved by capability, with
+`depends_on` gating readiness exactly like M8's original diamond fixture.
+Each downstream task starts with a placeholder input — `addTask()` never
+validates input against an agent's contract, only execution does — and
+receives its REAL input, genuinely derived from the real completed output
+of the task(s) it depends on, via `store.updateTask()` (an existing
+`STORAGE_CONTRACT` method, already used throughout `runtime.js` and
+`workflow.js` for task bookkeeping) called between rounds, while the
+downstream task is still `PENDING` and before it becomes ready. This adds
+no new storage method and no new coordinator surface.
+
+**The router's own budget pre-check and `addTask()`'s budget check
+overlap completely for the tree-level dimension, in this synchronous
+system — discovered, not designed.** Both read the identical
+`tree.spent >= tree.limit` row with the identical operator, evaluated
+microseconds apart within one synchronous `proposeTask()` call, so the
+router's advisory `BUDGET_INSUFFICIENT` pre-check always fires first when
+a proposal goes through the coordinator — no reservation is ever made for
+`addTask()`'s own `BUDGET_EXCEEDED` check to later refuse. That check is
+not dead: it remains the authoritative backstop for a caller that
+bypasses the router entirely and calls `workflow.addTask()` directly with
+a hand-picked `agent_slug`, exactly as every pre-M14 test still does (see
+test 296). Two independent checks, one advisory and one authoritative,
+happening to agree in a single-threaded process is not the same claim as
+"one of them is redundant."
+
+**Guardian's integration point is exactly one call, at exactly one
+place.** `runStep()` calls `guardian.evaluate()` once, after
+`workflow.step()`, so a freeze condition the step's own audit writes just
+created takes effect before the *next* round — a frozen agent's
+still-`PENDING` retry fails `runtime.js`'s existing pre-flight before its
+handler runs again (test 298 proves the handler call-count stays flat
+across the freeze), and a frozen agent is excluded from `router.route()`'s
+candidates on the next `proposeTask()` (test 298 also proves a
+well-formed proposal in an *unrelated* workflow is refused, since the
+freeze is agent-scoped, not workflow-scoped). No new freeze check was
+written for this milestone; the coordinator only calls the existing one
+at a point where it matters.
+
+**Retried tasks are a documented, bounded gap in router concurrency
+accounting, not an oversight.** `workflow.step()`'s automatic retry binds
+the new task to the same `agent_slug` as the failed original — no
+re-routing, unchanged M8 behavior. A retried task therefore never
+acquires a router reservation, and none needs releasing; router
+concurrency accounting simply does not include in-flight retries. Not a
+security gap — a retried task still passes through `runtime.js`'s full,
+unchanged pre-flight (approved version, active state, every freeze scope)
+like any other task. Test 300 proves the reservation count returns to
+zero at the end regardless.
+
+**The model/resource-governor sync/async boundary (D28, D29, D30) is
+extended, not closed, by this milestone — deliberately.** The M14 demo's
+research-agent calls the deterministic mock provider through the
+existing, *synchronous* `model-runtime.js` pipeline (M7), wired into
+`runtime.js`'s `modelRuntime` exactly as every handler since M7 expects —
+proving the full governed model-call path end to end, with zero paid API
+calls, without needing anything new. `async-model-runtime.js` and
+`resource-governor.js` (M12, M13) remain real, fully tested, and NOT
+live-wired: making them the live path still requires the same handler-
+and-`runtime.js`-wide async conversion D28 first named for
+`postgres-store.js` and D29/D30 already deferred for the model layer.
+Nothing about M14's multi-agent execution needed that conversion — every
+demo agent's model call and every tool call in this milestone completes
+synchronously within one `workflow.step()` call, so "concurrent" fan-out
+(test 285: `analysis` and `validation` both executing within one `step()`
+round) means one JS call, one thread, sequential-within-the-round — never
+wall-clock parallelism. Stated here honestly, per the milestone's own
+requirement, rather than implied.
+
+**What this milestone deliberately does not do.** It does not modify
+`workflow.js`, `router.js`, `guardian.js`, `runtime.js`, `broker.js`, or
+`store.js` — every file the coordinator depends on is exercised through
+its existing public API only. It does not add a storage method, a
+dependency, a credential, or a network primitive (tests 302, 303, 307
+check this structurally). It does not give a handler any new capability —
+test 306 proves the one place a handler is ever invoked
+(`runtime.js`) still passes exactly `{input, callTool, callModel,
+DECISION}`, unchanged; a handler cannot reach the router, the
+coordinator, or the store no matter what its own or another agent's
+output contains (tests 287, 288 exercise this adversarially, reusing the
+M14 directive's own example authorization-shaped output).
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
