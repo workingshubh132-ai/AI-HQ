@@ -2,13 +2,17 @@
 
 `src/providers/` (Milestone 21) is a provider-ready foundation for content
 generation across five categories: text, image, audio, video, and
-subtitle/transcription. It is a **standalone layer, not yet wired into
-live task execution** — the same "build the foundation, prove it, wire
-it in later" discipline M19's artifact system followed before M20 wired
-it into `runtime.js`. Nothing in `broker.js`, `runtime.js`, `validator.js`,
-`guardian.js`, `approval-engine.js`, `router.js`, `workflow.js`, or
-`execution-coordinator.js` imports, or is imported by, anything under
-`src/providers/`.
+subtitle/transcription. It was built as a **standalone layer** — the
+same "build the foundation, prove it, wire it in later" discipline
+M19's artifact system followed before M20 wired it into `runtime.js` —
+and, as of Milestone 22, is now genuinely wired into real task
+execution via one additive closure on `runtime.js`. §1a below covers
+the execution wiring; §1 below still describes the foundation itself,
+unchanged since M21. `broker.js`, `validator.js`, `guardian.js`,
+`approval-engine.js`, `router.js`, `workflow.js`, and
+`execution-coordinator.js` remain unimported by, and do not import,
+anything under `src/providers/` — only `runtime.js` now does, and only
+through the one narrow `providerInvoker` dependency described below.
 
 Today, every registered provider is **deterministic** — a pure function
 producing clearly synthetic fixture output, never a real network call.
@@ -69,6 +73,117 @@ Five files carry this:
   M20).
 - **`default-registry.js`** — the five deterministic providers,
   registered, ready to use in tests or a future demo.
+
+## 1a. Real execution (Milestone 22)
+
+The full chain, now real end to end:
+
+```
+AGENT
+  ↓
+ROUTER              (router.js — unmodified)
+  ↓
+WORKFLOW             (workflow.js — unmodified)
+  ↓
+EXECUTION COORDINATOR (execution-coordinator.js — unmodified)
+  ↓
+RUNTIME              (runtime.js — ONE new optional dependency:
+                       providerInvoker; ONE new closure: generateContent)
+  ↓
+PROVIDER INVOCATION   (src/providers/invoke.js — unmodified logic,
+                       M21; two audit-only fields added, M22)
+  ↓
+CONTENT RESULT        (the provider's validated, governed output)
+  ↓
+ARTIFACT SERVICE      (src/providers/artifact-bridge.js extracts safe
+                       content fields; artifact-service.js — M19/M20,
+                       unmodified — creates the artifact)
+  ↓
+AUDIT                 (provider.invocation + artifact.created events,
+                       both carrying real agent_slug/task_id/tree_id)
+```
+
+**`createRuntime({ ..., providerInvoker })`** — a new, optional
+constructor dependency, alongside the existing `modelRuntime` and
+`artifactService`. Omitted by any handler that never generates provider
+content (calling `generateContent` without it throws a clear,
+dedicated error — never a silent no-op). Must be a
+`createProviderInvoker()` instance (`src/providers/invoke.js`, M21) —
+already synchronous, already governed. `runtime.js` holds **no
+reference to the provider registry itself** — only to the
+already-governed invoker built over it, once, outside any handler's
+reach (proven directly: test 557). There is no `providerRegistry`
+parameter anywhere in `runtime.js`, and none is ever exposed to a
+handler.
+
+**`generateContent(request)`** — the one new capability a handler
+receives, alongside the existing `callTool`/`callModel`/`createArtifact`
+(the exact, complete, fixed set — test 527 reproduces the literal
+handler-invocation line). It is not a fourth implementation of
+anything: it is `providerInvoker.invoke()` (M21's full governed
+pipeline — provider/model lookup, capability check, input/output size
+ceilings, bounded retry, output shape validation) followed by the SAME
+`createArtifact` closure M20 already built (trusted provenance,
+checksum, lineage), called in exactly that order. A request names
+`provider_id`/`model_id`/`required_capability`/`input`/`max_retries`/
+`artifact_type`/`parent_artifact_ids`/`reason` — nothing else is ever
+read from it, by construction, not merely by convention: even a request
+carrying `agent_id`/`version_id`/`registry_sha`/`workflow_id`/`task_id`/
+`provenance` has those fields simply never accessed at this layer
+(tests 532–537), and `artifact-service.js`'s own M19 anti-impersonation
+check would independently ignore them a second time even if they
+somehow arrived.
+
+Return shape mirrors `createArtifact`'s own `{outcome, code, artifact,
+detail}` vocabulary exactly, plus the raw `provider_result`:
+
+```js
+// success
+{ outcome: 'created', code: 'OK', artifact: {...}, provider_result: {...} }
+// provider-side failure (unknown provider/model, timeout, retry
+// ceiling, oversized input/output, malformed response, ...)
+{ outcome: 'rejected', code: 'PROVIDER_NOT_FOUND', detail: '...', artifact: null, provider_result: {...} }
+// artifact-side failure (unknown artifact_type, missing/cross-workflow
+// parent, cycle, ...)
+{ outcome: 'rejected', code: '...', detail: '...', artifact: null, provider_result: {...} }
+```
+
+A handler always gets DATA back, never a crash it cannot inspect —
+though a handler that chooses to `throw` on a rejection (as every demo
+agent in this milestone does, via a small `requireGenerated()` helper)
+still fails the task safely through `runtime.js`'s existing
+`HANDLER_ERROR` path, exactly as `createArtifact` rejections already do.
+
+**Two new demo agents prove the wiring, end to end:**
+
+- **`content-agent`** (`src/demo-content-agent.js`) — the smallest
+  possible proof: one task, one `generateContent()` call, one real
+  SCRIPT artifact from the deterministic text provider.
+- **Six `media-*-agent`s** (`src/demo-media-pipeline-agents.js`) — a
+  full `RESEARCH → SCRIPT → AUDIO → IMAGE → {VIDEO, SUBTITLE}` pipeline
+  through the real, unmodified router/workflow/execution-coordinator
+  chain, reusing M20's exact self-chaining (`proposed_child_tasks`) and
+  diamond-lineage pattern (VIDEO converges on AUDIO+IMAGE) — no second
+  orchestration or lineage mechanism was built. SUBTITLE is parented on
+  AUDIO rather than SCRIPT (M20's choice): `deterministic-subtitle-v1`'s
+  own contract requires `input.audio_artifact_id`, so parenting on audio
+  is the honest, contract-driven choice once a real provider contract
+  exists to defer to.
+
+**What did not change to make this work:** `resource-governor.js` is
+still not live-wired into `runtime.js` — it never was, even for
+`callModel` (D28: the governor is async, the handler-execution path is
+synchronous by design). A fresh test (554) proves `generateContent`-
+shaped requests still compose correctly with the real, unmodified
+governor, using the real default registry and the real demo agents'
+own provider_id/model_id — not merely a synthetic example. Guardian
+freezes required zero new code: they already block agent EXECUTION
+before any handler runs (M4/M8), so they block `generateContent`
+automatically, for free (test 552: zero provider invocations, zero
+artifacts, when frozen). Approval policy is unchanged: GREEN-clearance
+generation runs without approval per existing policy; a YELLOW-clearance
+agent's separate tool call still needs real approval regardless of
+whether it also generated content (test 528).
 
 ## 2. Deterministic providers
 
@@ -231,3 +346,20 @@ provider file; unchanged by this milestone).
   and Broker isolation are each disabled or inverted in place, the test
   suite run to confirm a specific, expected failure, then the file
   restored — see `docs/DECISIONS.md` D38 for the full results.
+
+**Milestone 22 additions** (`tests/provider-execution.test.js`, 44
+tests): the same disciplines, extended through real execution rather
+than direct invoker composition. 25 adversarial scenarios (forged
+provider_id/agent_id/version_id/registry_sha/workflow_id/task_id/
+provenance/budget/freeze/approval/clearance; a rogue provider attempting
+tool execution; oversized input/output; invalid artifact_type; invalid
+provider response; a frozen agent; insufficient budget) are each proven
+through a REAL `runtime.runTask()` call, not a bare `invoke()`. Three
+new mutations target `runtime.js`'s own new code specifically (the
+provider-failure fail-closed gate, reuse of the trusted `createArtifact`
+closure rather than a direct `artifactService` call, and the invalid-
+artifact_type rejection path) — all 10 of M21's original mutations were
+also re-run against the current files and the FULL test suite (not just
+`tests/providers.test.js`) to confirm this milestone's `invoke.js` edit
+(two audit-only fields) weakened nothing. All 13 mutations caught; see
+`docs/DECISIONS.md` D39.

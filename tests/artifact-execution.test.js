@@ -786,7 +786,17 @@ test('480. structural: runtime.js\'s createArtifact closure never grants authori
     assert.ok(!source.includes(term), `runtime.js must not reference "${term}"`);
   }
   assert.ok(source.includes('createArtifactSync'), 'runtime.js uses the synchronous entry point, not the async one');
-  assert.ok(!source.includes('createArtifact('), 'runtime.js never calls the async createArtifact directly');
+  // This test's actual claim is narrower than "the substring createArtifact(
+  // never appears": M22 added a legitimately-named local closure, ALSO
+  // called `createArtifact` (the same one this handler-facing capability
+  // has been named since M20), which `generateContent` calls internally —
+  // that call site necessarily contains the literal text "createArtifact(".
+  // What this test must actually rule out is runtime.js calling
+  // artifactService's ASYNC method directly (`artifactService.createArtifact(`,
+  // as opposed to `.createArtifactSync(`) — that specific, precise
+  // substring is the one that would indicate the D28 sync/async boundary
+  // was bypassed. See DECISIONS.md D39.
+  assert.ok(!source.includes('artifactService.createArtifact('), 'runtime.js never calls the async createArtifact directly');
 });
 
 test('481. structural: no new network, credential, or shell-execution primitive in any M20 file', () => {

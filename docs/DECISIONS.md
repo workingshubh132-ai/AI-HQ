@@ -2181,6 +2181,153 @@ call, no token/quota bypass mechanism of any kind.
 
 ---
 
+## D39 — Real provider-to-agent execution: one closure composing two already-governed pieces, nothing reinvented
+
+Decided 2026-08-22 (Milestone 22).
+
+M21 built `src/providers/` standalone, proven correct on its own but
+wired into nothing. M22 wires it into real execution — the exact "wire
+in only in a later milestone" step M21's own header predicted, and the
+same shape M20 was for M19's artifact system: `runtime.js` gains one
+optional dependency (`providerInvoker`) and one additive closure
+(`generateContent`), alongside the existing `callTool`/`callModel`/
+`createArtifact`. `broker.js`, `validator.js`, `guardian.js`,
+`approval-engine.js`, `router.js`, and `workflow.js` are unchanged.
+`execution-coordinator.js` is unchanged too — only its OWN test file's
+one exact-match structural assertion was updated to match the new,
+wider (still fixed) handler-call signature; the coordinator's own
+source is untouched. `src/providers/invoke.js` gained two audit-only
+fields (`agent_slug`/`task_id`/`tree_id`, mirroring `model-runtime.js`'s
+identical fields); every other provider file (`registry.js`,
+`contracts.js`, `artifact-bridge.js`, all five deterministic providers)
+is byte-for-byte unchanged.
+
+**Provider capability injection: composition, not a third
+implementation.** `generateContent(request)` is not a new authorization
+mechanism or a new artifact-creation path — it is `providerInvoker.invoke()`
+(M21 — provider/model lookup, capability check, input/output size
+ceilings, bounded retry, output shape validation, all before this ever
+sees a result) followed by the SAME `createArtifact` closure M20 already
+built (trusted provenance, checksum, lineage), called in the exact order
+the M22 directive names: PROVIDER INVOCATION → CONTENT RESULT → ARTIFACT
+SERVICE. The handler receives this one narrow function — never the
+provider registry, never the resource governor, never anything that
+could register a provider or grant authority (test 557 proves runtime.js
+holds no reference to `providerRegistry` or the registry constructor at
+all — only to the already-governed invoker built over it, once, at
+construction time, outside any handler's reach).
+
+**Trusted execution context, restated for a third capability.** Exactly
+like `callModel` and `createArtifact` before it, `generateContent`
+reads `provider_id`/`model_id`/`required_capability`/`input`/
+`max_retries` from the handler's request by NAME — never by spreading
+the whole request object — and supplies `agent_slug`/`task_id`/`tree_id`
+from this closure's own trusted context, not from anything the handler
+passed in. A request smuggling `agent_id`/`version_id`/`registry_sha`/
+`workflow_id`/`task_id`/`artifact_id`/`provenance` has these fields
+simply never read at this layer (tests 532–537); even if they somehow
+reached `createArtifact` (they cannot, structurally), `artifact-service.js`'s
+own M19 anti-impersonation check would still ignore them independently —
+defense in depth confirmed at two layers, not assumed.
+
+**Deterministic provider execution, now through real task execution.**
+Every artifact `content-agent` and the six `media-*-agent`s produce
+comes from one of M21's five deterministic fixture providers — the
+`[SYNTHETIC FIXTURE — not real model output]` marker (test 517) and the
+`fixture://` content_ref scheme survive unmodified into the real
+artifact record. Nothing here is claimed as real AI generation at any
+point in the new demo agents, their tests, or this document.
+
+**Artifact integration reuses M20's mechanism exactly — no second
+lineage system.** Parent linkage is still carried through task `input`
+(an upstream artifact_id, forwarded explicitly by the caller or the
+existing `proposed_child_tasks` self-chain mechanism, unchanged since
+M8); `generateContent`'s `parent_artifact_ids` is validated by the same,
+untouched M19 checks (existence, same-workflow, no cycle — tests
+507–509 prove this by composing with the real artifact service, not by
+re-testing M19's internals a second time). The six-stage media pipeline
+(test 524) produces the same diamond shape M20's own demo did — VIDEO
+converging on AUDIO+IMAGE — with one deliberate, contract-driven
+difference: SUBTITLE is parented on AUDIO, not SCRIPT, because
+`deterministic-subtitle-v1`'s own contract requires
+`input.audio_artifact_id` (M21) — a more honest choice now that a real
+provider contract exists to defer to, where M20's caption stage had none
+yet and chose SCRIPT for depth reasons alone.
+
+**Resource governance: composed and proven, not newly wired live —
+matching `callModel`'s own precedent exactly.** `resource-governor.js`
+(M13) is async; `runtime.js`'s handler-execution path is synchronous by
+design (D28) and always has been — `callModel` itself was never wired
+through the governor live either, for the identical reason. M22 does not
+change this boundary. What M22 adds is a fresh proof (test 554) that
+`generateContent`-shaped requests, reaching the REAL default provider
+registry through the REAL `invoke.js`, still compose correctly with the
+unmodified governor exactly as M21's test 499 already proved in the
+abstract — now demonstrated with the actual demo agents' own
+provider_id/model_id, not just a synthetic example. The honest
+reframing from D38 still holds: a genuinely zero-cost deterministic
+provider cannot exhaust a monetary budget by definition, so the proof is
+via `MAX_CALLS_PER_TASK`, the governor's own independent, real ceiling.
+
+**Guardian interaction required zero new code.** A freeze blocks agent
+EXECUTION in `runtime.js`'s existing pre-flight (M4/M8, unmodified) —
+before the handler ever runs, before `generateContent` is ever called,
+before the provider is ever invoked. Test 552 proves this directly: zero
+`provider.invocation` audit events, zero artifacts, when a frozen
+agent's task is attempted. There was no freeze-specific branch to add
+inside `generateContent` because the existing boundary already covers
+every path into a handler, this one included, by construction.
+
+**Approval interaction: unchanged, and deliberately not
+reimplemented.** GREEN-clearance content generation runs without
+approval, per existing, untouched policy — `content-agent` and every
+`media-*-agent` declare GREEN clearance and no tools. Test 528 proves
+`generateContent` and Broker-mediated tool authorization are fully
+independent for a YELLOW-clearance agent: the artifact is created
+regardless of whether the SEPARATE, unrelated tool call it also makes
+gets approved. No second approval mechanism was invented; a handler
+claiming `approval_status: 'approved'` on its own request (test 540)
+means nothing to the real Approval Engine.
+
+**Security isolation: re-swept, not merely re-asserted.** Every file
+this milestone added or modified was grepped for
+`broker.execute`/`broker.authorize`/`createBroker`/`store.addFreeze`/
+`createGuardian`/`.decide(`/`.revoke(`/`createApprovalEngine`/
+`setLifecycleState`/`setActiveVersion`/`chargeBudgets`/`addBudget`
+(tests 543–546) — legitimate, pre-execution `registerAgent`/
+`addAgentVersion` setup calls in the two new demo files' own
+registration helpers are the one deliberate exclusion, identical to
+every prior milestone's demo-file registration pattern (M14, M20). A
+rogue provider whose output is shaped exactly like an authorization
+decision (test 542, reusing M21's own `AUTHORIZATION_SHAPED_OUTPUT`
+fixture through REAL runtime execution rather than direct invoker
+composition) still produces only a valid artifact — never a state
+change anywhere else, confirmed by an independent, real
+`broker.execute()` call for the named tool.
+
+**Why no live provider (Groq, Claude, OpenAI, or otherwise) is
+connected.** Unchanged from D38: no credential is read, fabricated, or
+required anywhere in this milestone (test 555, re-sweeping every file
+M22 touched); the entire new test suite (44 new tests in
+`tests/provider-execution.test.js`, plus 4 pre-existing structural
+tests updated to match the new, still-fixed handler-call signature —
+339, 358, 306, 480) runs with zero environment configuration and zero
+network access. "Provider-ready" remains a structural claim proven by real,
+governed composition through real execution — not a working live
+integration, and not described as one anywhere in this milestone's code,
+tests, or documentation.
+
+**What this milestone deliberately does not do.** No live/network
+provider connected. No change to the D28 sync/async boundary — the
+resource governor remains proven-by-composition, not live-wired, for
+exactly the reason `callModel` was never live-wired to it either. No new
+artifact-lineage mechanism (M20's is reused verbatim). No new approval
+mechanism. No blob storage behind `content_ref` (M19's deferred
+boundary, still unchanged). No new dependency, credential, network
+primitive, paid API call, or quota-bypass mechanism of any kind.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

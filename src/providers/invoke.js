@@ -55,6 +55,17 @@ export function createProviderInvoker({ registry, audit, clock }) {
       const record = {
         event: 'provider.invocation',
         at: clock(),
+        // agent_slug/task_id/tree_id are ONLY ever present when a caller
+        // (runtime.js's generateContent closure, M22) supplies them —
+        // this file has no execution context of its own and never
+        // derives them; a caller that omits them (every M21 test, and
+        // any direct standalone use of this invoker) simply gets `null`
+        // here, unchanged from before M22. Mirrors model-runtime.js's
+        // identical settle() fields exactly, for audit-trail parity
+        // between the two governed invocation paths.
+        agent_slug: request?.agent_slug ?? null,
+        task_id: request?.task_id ?? null,
+        tree_id: request?.tree_id ?? null,
         provider_id: request?.provider_id ?? null,
         model_id: request?.model_id ?? null,
         status,

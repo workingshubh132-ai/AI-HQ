@@ -576,9 +576,10 @@ test('306. a handler is structurally unable to reach the router at all — runti
   const src = readFileSync(new URL('../src/runtime.js', import.meta.url), 'utf8');
   assert.ok(
     // M20 widened the fixed set to include createArtifact (see
-    // DECISIONS.md D37) — still no router, coordinator, or store
+    // DECISIONS.md D37); M22 widened it again to include generateContent
+    // (see DECISIONS.md D39) — still no router, coordinator, or store
     // reference, which is this test's actual claim.
-    src.includes('handler({ input, callTool, callModel, createArtifact, DECISION })'),
+    src.includes('handler({ input, callTool, callModel, createArtifact, generateContent, DECISION })'),
     'the one place a handler is ever invoked must pass exactly this fixed set — no router, no coordinator, no store',
   );
 });

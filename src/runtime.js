@@ -25,6 +25,7 @@
 import { taskSignature, MAX_DEPTH } from './limits.js';
 import { DECISION } from './broker.js';
 import { checkContract } from './contracts.js';
+import { buildArtifactRequestFromProviderResult } from './providers/artifact-bridge.js';
 
 export const TASK_STATUS = Object.freeze({
   PENDING: 'pending',
@@ -81,8 +82,25 @@ function checkEnvelope(envelope) {
  *   synchronous, in-memory store/artifactStore this runtime already
  *   runs against (D28) — `createArtifactSync` throws loudly rather than
  *   misbehave if handed an async (Postgres) one. See DECISIONS.md D37.
+ * @param {{invoke: Function}} [deps.providerInvoker]  optional, M22.
+ *   Omitted by every handler that doesn't generate provider content —
+ *   which, before M22, was all of them. Handlers that never reference
+ *   `generateContent` are unaffected by its presence or absence. Must be
+ *   a `createProviderInvoker()` instance (src/providers/invoke.js, M21) —
+ *   already synchronous, already governed (provider/model lookup,
+ *   capability check, input/output size ceilings, bounded retry, output
+ *   shape validation). `generateContent` needs BOTH this and
+ *   `artifactService` to do its job (invoke, then create the resulting
+ *   artifact) — if either is missing, calling it throws, the same way
+ *   `callModel`/`createArtifact` already do when their own dependency is
+ *   missing. This runtime holds no reference to the provider REGISTRY —
+ *   only to the already-governed invoker built over it — so a handler
+ *   can never reach provider registration, provider limits, or anything
+ *   the invoker itself does not expose. See DECISIONS.md D39.
  */
-export function createRuntime({ store, broker, audit, clock, handlers, registrySha, modelRuntime, artifactService }) {
+export function createRuntime({
+  store, broker, audit, clock, handlers, registrySha, modelRuntime, artifactService, providerInvoker,
+}) {
   /**
    * Runs one task to completion.
    * @returns {object} the final task record
@@ -232,9 +250,75 @@ export function createRuntime({ store, broker, audit, clock, handlers, registryS
       ? (request) => artifactService.createArtifactSync({ ...request, agent_slug, workflow_id: tree_id, task_id })
       : () => { throw new Error('no artifact service configured for this agent'); };
 
+    // The handler's only route to provider-backed content generation
+    // (M22). This is a COMPOSITION of two already-governed, already-
+    // trusted pieces — not a third implementation of either: `invoke.js`
+    // (M21 — provider/model lookup, capability check, input/output size
+    // ceilings, bounded retry, output shape validation, all before this
+    // ever sees a result) and the `createArtifact` closure defined just
+    // above (M20 — trusted provenance, checksum, lineage). Exactly the
+    // order the M22 directive's own diagram names: PROVIDER INVOCATION ->
+    // CONTENT RESULT -> ARTIFACT SERVICE.
+    //
+    // A handler's request may name provider_id/model_id/required_capability/
+    // input/max_retries/artifact_type/parent_artifact_ids/reason — never
+    // agent identity, version, registry SHA, workflow, or task: those,
+    // exactly as createArtifact already guarantees, come only from THIS
+    // closure's trusted execution context (agent_slug/task_id/tree_id,
+    // spread into the invoker call the same way callModel already does
+    // above), never from the handler's own request object. The handler
+    // receives this one narrow function — never the provider registry,
+    // never the resource governor, never anything that could register a
+    // provider or grant authority. See DECISIONS.md D39 and this
+    // milestone's adversarial tests.
+    const generateContent = (providerInvoker && artifactService)
+      ? (request) => {
+          const providerResult = providerInvoker.invoke({
+            provider_id: request?.provider_id,
+            model_id: request?.model_id,
+            required_capability: request?.required_capability,
+            input: request?.input,
+            max_retries: request?.max_retries,
+            agent_slug, task_id, tree_id,
+          });
+          if (providerResult.status !== 'ok') {
+            return {
+              outcome: 'rejected', code: providerResult.reason, detail: providerResult.detail ?? null,
+              artifact: null, provider_result: providerResult,
+            };
+          }
+          let artifactRequest;
+          try {
+            artifactRequest = buildArtifactRequestFromProviderResult({
+              providerResult,
+              artifact_type: request?.artifact_type,
+              parent_artifact_ids: request?.parent_artifact_ids ?? [],
+              reason: request?.reason ?? null,
+            });
+          } catch (err) {
+            // buildArtifactRequestFromProviderResult throws on an unknown
+            // artifact_type (see artifact-bridge.js) — reported here as
+            // ordinary rejection DATA, exactly like every other fail-
+            // closed reason above, not as a thrown HANDLER_ERROR: a
+            // handler asking for an unsupported artifact_type is a
+            // request-shape problem the handler can inspect and react to,
+            // the same category of thing PROVIDER_CONTRACT_VIOLATION
+            // already names for the request's `input` shape.
+            return {
+              outcome: 'rejected', code: 'PROVIDER_CONTRACT_VIOLATION', detail: String(err.message),
+              artifact: null, provider_result: providerResult,
+            };
+          }
+          // createArtifact independently re-derives and validates
+          // everything regardless (defense in depth, not the only guard —
+          // see createArtifact's own comment above and DECISIONS.md D37).
+          return { ...createArtifact(artifactRequest), provider_result: providerResult };
+        }
+      : () => { throw new Error('no provider invoker/artifact service configured for this agent'); };
+
     let envelope;
     try {
-      envelope = handler({ input, callTool, callModel, createArtifact, DECISION });
+      envelope = handler({ input, callTool, callModel, createArtifact, generateContent, DECISION });
     } catch (err) {
       return fail(RUNTIME_REASON.HANDLER_ERROR, String(err.message));
     }
