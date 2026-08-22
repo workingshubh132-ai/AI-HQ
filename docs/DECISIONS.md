@@ -1691,6 +1691,215 @@ new dependency, no network primitive, no credential.
 
 ---
 
+## D36 — Content artifacts: a separate store and service, zero changes to any existing file
+
+Decided 2026-08-22 (Milestone 19).
+
+`src/artifacts.js` (contract + type registry), `src/artifact-store.js`
+(in-memory storage), `src/postgres-artifact-store.js` (Postgres storage),
+and `src/artifact-service.js` (the governed creation/read path) are all
+new files. **Nothing else changed** — `broker.js`, `runtime.js`,
+`workflow.js`, `router.js`, `guardian.js`, `storage.js`, `store.js`,
+`postgres-store.js`, and `approval-engine.js` are all confirmed unchanged
+(`git status --porcelain` shows only new `??` files, no `M`). This is the
+first milestone since M14 with no touch to any existing security file at
+all — not because none was needed and forced through anyway, but because
+inspection found none was.
+
+**A separate `ARTIFACT_STORE_CONTRACT`, not an extension of
+`STORAGE_CONTRACT`.** `storage.js`'s own header says its contract is "the
+state every backend must satisfy for the Broker" — agents, approvals,
+freezes, budgets, idempotency. Artifacts are read by nothing in that
+list; the Broker, Guardian, and Approval Engine never reference them.
+Folding a content/provenance model into the same contract as
+authorization-critical state would conflate two concerns the directive
+itself asked to keep apart, in the same spirit `STORAGE_CONTRACT`'s own
+comment already argues for keeping *its* thirteen methods together and
+nothing else. The new contract is four methods
+(`addArtifact`/`getArtifact`/`artifactsForWorkflow`/`childrenOf`) —
+deliberately no update, no delete: immutability here is the absence of a
+mutation code path, the same design `audit.js` already uses for its own
+append-only records, not a rule enforced by a check that could itself be
+disabled.
+
+**Anti-impersonation: identity is re-derived, never trusted from the
+request.** A creation request supplies `agent_slug` — the same trust
+boundary `approval-engine.js`'s `requestApproval` already accepts.
+`agent_id`/`version_id` are resolved fresh from `store.getAgent`;
+`registry_sha` comes only from this service's own constructor injection,
+mirroring `createBroker`'s and `createApprovalEngine`'s identical
+parameter; `provenance` is a DERIVED, read-only view built from those
+already-validated fields, never accepted as input. A request that
+includes forged `agent_id`, `version_id`, `registry_sha`, `artifact_id`,
+`created_at`, or `provenance` values has every one of them silently
+overwritten by the real, resolved values (test 401; mutation-tested —
+see below).
+
+**Not a second authorization boundary — this is the milestone's central
+constraint, and the design that makes it true is structural, not just
+documented.** `createArtifact` validates that a request is WELL-FORMED
+(real agent, real task in the declared workflow, real same-workflow
+parents, no cycle, a coherent content/checksum/mime_type triple). It
+never asks whether the agent was ALLOWED to produce the artifact — that
+already happened upstream. `artifact-service.js` holds no reference to
+`broker.execute`/`broker.authorize`, `createBroker`, Guardian's
+`activeFreeze`/`addFreeze`, the Approval Engine's `decide`/`revoke`/
+`createApprovalEngine`, or any budget-charging or lifecycle-mutating
+method — proven both structurally (test 431 greps the source) and
+behaviorally (tests 426–430: a YELLOW action with no approval is still
+denied after an artifact referencing it is created; forged
+`approval_status: 'approved'` metadata on an artifact satisfies nothing
+in the Broker; an active Guardian freeze is untouched by artifact
+creation and still blocks execution; no budget or lifecycle state ever
+changes). `approval_status` on an artifact is deliberately DESCRIPTIVE
+ONLY, reusing the Approval Engine's own vocabulary rather than inventing
+a parallel one (test 427 proves the Broker never reads it).
+
+**`status` and `approval_status` are two different fields because the
+M19 directive's own contract list names both separately.** `status`
+(`complete`/`failed`) answers whether *producing* the artifact succeeded
+— a FAILED record carries no content but is still legitimate provenance
+("agent X attempted to render audio from this script and failed").
+`approval_status` answers whether policy required, and a human gave,
+sign-off on this specific piece of content — never authoritative, never
+consulted by the Broker, always reusable data recorded by a real
+`approval-engine.js` decision if one happens.
+
+**`provenance` is a derived view, not a second source of truth.** The
+directive's contract list names `provenance` alongside `agent_id`,
+`version_id`, `workflow_id`, `task_id`, `registry_sha`,
+`parent_artifact_ids`, `provider_id`, `provider_version`, and `model_id`
+as distinct fields — but every existing record in this codebase
+(approvals, tasks, agent versions) represents this kind of information as
+flat, independently-validated fields, never a nested object. Rather than
+invent a new shape this codebase has never used, `provenance` is computed
+once at creation from those already-flat, already-validated fields and
+frozen — a convenience view that cannot diverge from the fields it
+mirrors, because it is never independently supplied or stored as its own
+column (see migration 0007's header).
+
+**Cycle detection uses path-tracking DFS, not a flat visited set — a
+naive implementation would have rejected the directive's own example
+lineages.** The M19 directive's own DAG examples are diamonds: `video`
+merging `audio` and `visuals`, both of which trace back to the same
+`script`. A "have I seen this node before, anywhere" check would flag
+that convergence as a cycle, which it is not. `hasCycle` (in
+`artifact-service.js`) instead tracks the current recursion path
+separately from fully-explored nodes — the standard white/gray/black DFS
+— so a node reached twice via two different parents is correctly allowed,
+while a genuine back-edge (a node revisited while still on the active
+path) is correctly rejected. Because `createArtifact` only ever links a
+new artifact to already-existing parents, service-mediated creation is
+acyclic by construction; the check exists as defense in depth against a
+store extended by some other path — a forged direct insert, a bug — and
+is proven against exactly that scenario (test 412: a hand-crafted 2-cycle
+inserted directly into the store, then an attempt to attach a new
+artifact to it, correctly refused) as well as against the legitimate
+diamond case (test 413) so the two are never confused.
+
+**Checksum and size are derived from the identical serialization, not
+computed twice.** `artifacts.js`'s `checksumOf` and `byteSizeOf` both run
+`payload.js`'s `stableStringify` — the exact function M4.5/M4.6 and M18
+already trust — over the same content, so the two numbers describing an
+inline artifact's bytes can never drift apart from using two different
+serializations. For `content_ref` (content stored out-of-band, not read
+by this milestone), `checksum` and `size` are trusted metadata the caller
+supplies, validated only for well-formedness (64 lowercase hex; a
+non-negative integer) — this codebase has no blob storage to
+independently verify them against, and inventing one was explicitly
+out of scope.
+
+**`artifact_type` gets a Postgres CHECK constraint, the same tradeoff
+D34 already made for `RUNTIME_STATE`.** `artifacts.js` documents
+`ARTIFACT_TYPE` as extensible by source change, not by a runtime-supplied
+string — adding a type is a code change (and, for Postgres, a migration
+widening the constraint), never data. This is the identical tradeoff
+migration 0005 made when `RUNTIME_STATE` gained `DISABLED`: a constraint
+costs a future migration when the registry grows, in exchange for the
+database refusing a garbage type outright. Following the established
+precedent rather than leaving the column unconstrained.
+
+**`parent_artifact_ids` is a plain `jsonb` array, not a join table.**
+`public.tasks.depends_on` already represents an identical
+"this row references other rows in the same table" relationship the same
+way, with no per-edge foreign key. Every actual integrity check for
+lineage (existence, same-workflow, no cycle) happens in
+`artifact-service.js` before a row is ever written; the database does not
+need to re-derive them. Matching the existing precedent was preferred
+over a second, inconsistent way of representing the same kind of
+relationship.
+
+**Async by design, like M17/M18 — not on the synchronous hot path.**
+Every `artifact-service.js` function is `async` and awaits every store
+call, including against the in-memory store, where it is a harmless
+no-op. The same bug class M17 and M18 both found and fixed (an unawaited
+call against a real async store returns an always-truthy pending Promise,
+silently defeating an `if (!x)` check) was designed around from the
+start here, informed directly by that precedent rather than
+rediscovered. This file is not on `broker.js`/`runtime.js`/
+`workflow.js`/`router.js`/`guardian.js`'s synchronous call path (D28), so
+there is no boundary to preserve by staying synchronous.
+
+**`generateArtifactId` uses `randomUUID()` from the start — M18's own
+collision bug, applied as a lesson rather than relearned.** M18's
+approval-engine.js originally generated IDs from a per-instance counter
+plus the injected clock, which collided across engine instances sharing
+a clock tick (discovered against a shared Postgres database) and had to
+be fixed with `randomUUID()`. `artifact-service.js`'s
+`generateArtifactId` uses `randomUUID()` unconditionally from the first
+version, with the clock retained only as a human-readable, roughly
+time-ordered prefix — never load-bearing for uniqueness.
+
+**No runtime.js/workflow.js integration in this milestone — verified,
+not merely asserted.** `runtime.js`'s handler signature
+(`{input, callTool, callModel, DECISION}`, unchanged since M14) carries
+no reference to the artifact system; a handler cannot reach it no matter
+what it returns (test 432: a rogue handler's result contains
+artifact-shaped fields including a forged `artifact_id` and
+`approval_status: 'approved'` — the task completes normally because the
+envelope is valid data, and no artifact was ever created from it,
+because no code path exists that could). The M19 directive's own
+"integrate only where necessary" and "do not rewrite runtime.js unless
+inspection proves a minimal integration is required" were read literally:
+inspection found no artifact-producing call site inside the live
+synchronous execution path at all yet (that would be a future
+milestone's job, wiring a real provider adapter to actually produce
+content), so no integration was made. This milestone builds the
+foundation — contract, storage, provenance, lineage, immutability — that
+a future wiring milestone would build on, without inventing the wiring
+itself ahead of a real caller.
+
+**Mutation testing: all 7 required checks caught with targeted
+failures.** Immutability (the store's duplicate-`artifact_id` guard),
+cycle detection, parent-existence, workflow isolation
+(cross-workflow-parent rejection), provenance binding (agent_id
+re-derivation), checksum validation (the `content_ref` format check),
+and artifact-type validation were each disabled or inverted in place,
+the test suite run to confirm specific named failures, then the file
+restored and diff-checked byte-identical before the next mutation. Every
+one produced a distinct, expected failure — no mutation went uncaught.
+
+**What this milestone deliberately does not do.** No provider
+integration (Groq, Anthropic, OpenAI, ElevenLabs, image/video APIs) —
+`generation_metadata`/`provider_id`/`provider_version`/`model_id` are
+inert metadata fields with no code that populates them from a real call.
+No blob/object storage (S3 or otherwise) — `content_ref` is an opaque,
+unvalidated, unfetched string; its interpretation is explicitly a future
+milestone's problem. No artifact-level read access control: the M19
+directive's own security list asks that an `artifact_id` not permit
+"reading arbitrary private artifacts," but this codebase has no existing
+precedent for per-resource read scoping on ANY resource (any caller can
+already read any task, any approval, any agent via the existing store) —
+inventing one here would be exactly the "parallel security system" the
+directive forbids, and nothing in this milestone's actual integration
+surface exposes artifact reads to an untrusted caller anyway (handlers
+still hold no reference to the service). Documented as a deferred
+boundary, the same honest treatment M18 gave authentication. No update
+or delete method, ever, on the artifact store. No new dependency, no
+network primitive, no credential.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
@@ -1706,6 +1915,8 @@ Not decided yet, and not needed yet. Listed so they are not forgotten.
 | Approval queue maximum (cap on outstanding pending approvals) | A concrete need for one is observed |
 | Where the freeze record lives (table vs columns) | Guardian milestone |
 | Concrete budget figures | Before the first paid API call |
+| Artifact-level read access control (per-agent/per-workflow scoping) | A real caller with untrusted read access exists |
+| Blob/object storage for `content_ref` | A provider adapter needs to store real bytes |
 
 Empty folders are not created ahead of need. Git cannot store an empty
 folder, and structure with nothing in it is a guess about the future
