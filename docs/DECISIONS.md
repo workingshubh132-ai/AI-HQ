@@ -1447,6 +1447,107 @@ placeholders only, and needed no change. It does not wire
 
 ---
 
+## D34 — Agent lifecycle: a governed transition graph, not a new authorization path
+
+Decided 2026-08-22 (Milestone 17).
+
+`src/agent-lifecycle.js` closes the gap between "RUNTIME_STATE is a
+defined set of strings" (agents.js, M5) and "the store's own lifecycle
+setter accepts any string with zero validation" (store.js, M6, and
+identically postgres-store.js, M11) — before this milestone, nothing in
+`src/` prevented calling that setter with `'retired'` immediately followed
+by `'active'`. `transition()` is now the one validated, audited path: an
+explicit graph over `RUNTIME_STATE` (RETIRED and the pre-existing, never-
+produced FROZEN value both terminal — no outgoing edges), a required
+`actor` and `reason` (following this codebase's existing plain-string
+convention — freezes' `imposed_by`, approvals' `decided_by`, versions'
+`approved_by` — rather than inventing an identity system), and one audit
+record per attempt, accepted or rejected.
+
+**Version approval and agent lifecycle stay genuinely independent
+controls, not by a new check but by this file never touching a version
+at all.** `transition()` has no reference to `addAgentVersion`,
+`setActiveVersion`, or `getAgentVersion` — enforced structurally (test
+348) as well as behaviorally (tests 330/331: an ACTIVE agent with an
+unapproved version is still `VERSION_NOT_APPROVED`; a PAUSED agent with
+an approved version is still `AGENT_NOT_ACTIVE` — both are the Broker's
+own, completely unmodified checks, exercised through a genuinely new
+lifecycle transition for the first time). The same is true of freezes:
+this file never calls `addFreeze` or `activeFreeze` (test 349), so a
+Guardian-imposed freeze cannot be "cleared" by a lifecycle transition —
+there is no code path by which it could be, not a check that stops one.
+Test 333 proves it directly: two legal transitions, back and forth, and
+the freeze — and the Broker's `AGENT_FROZEN` denial — are both still
+there afterward.
+
+**DISABLED is genuinely new; FROZEN is not.** `RUNTIME_STATE` gained
+`DISABLED` — an explicit administrative off-switch distinct from PAUSED
+(lighter, easily reversed) and RETIRED (terminal) — because the M17
+directive asks for it by name and nothing existing already meant that.
+`FROZEN` was already a `RUNTIME_STATE` member since M5 but, on inspection,
+is produced by no code path anywhere in this codebase — the operative
+freeze mechanism has always been the separate `freezes` table. Rather
+than invent transition rules for a state nothing sets, the graph gives it
+no outgoing edges, the fail-closed choice, and says so in the file
+comment instead of leaving it an unexplained gap.
+
+**One deviation from "do not touch the frozen security files":
+`broker.js` needed a one-line addition.** `validateAgent()` checks
+`agent.state` against its own hardcoded `AGENT_STATES` allowlist — a
+list that, on inspection, already includes `'draft'`/`'testing'` (values
+`RUNTIME_STATE` has never had) and was independent of it before this
+milestone. Without adding `'disabled'` to that list, a DISABLED agent
+would still be denied — `validateAgent()` runs before the active-state
+check either way — but via the generic `INVALID_AGENT` ("unrecognised
+lifecycle state") rather than the specific, correct `AGENT_NOT_ACTIVE`.
+Security was never at stake (both outcomes are DENY); correctness of the
+reported reason was. This is a pure allowlist widening — one string
+added, no control-flow change, every existing test unaffected — the
+narrowest form the M17 directive's own escape valve ("if a frozen file
+MUST change, report exactly why") anticipates. `runtime.js` and
+`router.js` needed no equivalent change: both already gate on
+`agent.state !== 'active'` generically, with no separate hardcoded list,
+so DISABLED was already correctly excluded by router eligibility (test
+340) and runtime pre-flight with zero code changes there.
+
+**Migration 0005 closes the matching schema gap.** 0003's
+`agents_lifecycle_state_check` constraint predates DISABLED and would
+reject it outright — without this migration, the in-memory store would
+silently accept the value (store.js validates nothing of its own) while
+the real Postgres adapter would reject it with a constraint violation, a
+divergence discovered and closed before it could surface as "works in
+memory, breaks in Postgres." A CHECK constraint cannot be altered in
+place; the migration drops and re-adds it with the same name, touching no
+other constraint, column, or row.
+
+**Async by design, unlike the live synchronous core.** `transition()` and
+`getLifecycleState()` `await` both of the two storage calls they make
+(`getAgent`, `setLifecycleState`) — a real bug was caught before it
+shipped: an earlier draft called them unawaited, which is harmless
+against the in-memory store but silently wrong against Postgres (an
+un-awaited `getAgent()` returns a pending Promise, always truthy,
+defeating the UNKNOWN_AGENT check entirely). This module is not on
+broker.js/runtime.js/workflow.js/router.js/guardian.js's hot synchronous
+path, so — unlike those files — there is no D28-style boundary to
+preserve by staying synchronous; making it genuinely async is what makes
+it genuinely portable to both storage implementations, proven directly
+by running the same behavioral assertions against both (tests 342/343).
+
+**What this milestone deliberately does not do.** It does not touch
+`runtime.js`, `workflow.js`, `router.js`, `guardian.js`,
+`execution-coordinator.js`, `validator.js`, `storage.js`, `store.js`, or
+`postgres-store.js` — all confirmed unchanged (`git diff --stat` empty).
+It adds no new storage method — `getAgent()` and `setLifecycleState()`
+both already existed, identically, on both stores. It does not touch
+router.js's own, narrower, pre-existing `setAgentHealth()` — that remains
+a thin, unvalidated convenience for the router's own health-signaling use
+case, not the sanctioned path for a general lifecycle change; unifying
+them was not required by this milestone's stated objective and was not
+done. It adds no dependency, no credential, no network primitive, no
+actor-identity system beyond a required plain string.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

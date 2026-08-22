@@ -28,11 +28,20 @@ export const VERSION_STATE = Object.freeze({
   SUPERSEDED: 'superseded',
 });
 
-/** Runtime lifecycle. Never versioned. */
+/** Runtime lifecycle. Never versioned.
+ *
+ * DISABLED added in M17: an explicit administrative off-switch, distinct
+ * from PAUSED (a lighter, more easily reversed state) and from RETIRED
+ * (permanent, terminal — see src/agent-lifecycle.js's transition graph).
+ * This object remains the single source of truth for which strings are a
+ * recognised lifecycle state; broker.js's own AGENT_STATES allowlist and
+ * validator.js's validateAgentRecord() both must stay in sync with it —
+ * see DECISIONS.md D34 for why broker.js needed a one-line addition here. */
 export const RUNTIME_STATE = Object.freeze({
   ACTIVE: 'active',
   PAUSED: 'paused',
   DEGRADED: 'degraded',
+  DISABLED: 'disabled',
   FROZEN: 'frozen',
   RETIRED: 'retired',
 });

@@ -59,8 +59,14 @@ export const REASON = Object.freeze({
 
 /** Agents may hold GREEN or YELLOW. RED is human-only by definition. */
 const AGENT_CLEARANCES = Object.freeze([TIER.GREEN, TIER.YELLOW]);
+// M17: 'disabled' added so a DISABLED agent is denied for the correct,
+// specific reason (AGENT_NOT_ACTIVE, checked immediately below) rather
+// than the generic INVALID_AGENT this array's own validateAgent() would
+// otherwise produce for an unrecognised state string. Either reason
+// still denies — this changes only which DENY reason is reported, never
+// whether the agent may execute. See DECISIONS.md D34.
 const AGENT_STATES = Object.freeze([
-  'draft', 'testing', 'active', 'degraded', 'paused', 'frozen', 'retired',
+  'draft', 'testing', 'active', 'degraded', 'paused', 'disabled', 'frozen', 'retired',
 ]);
 const APPROVAL_STATUSES = Object.freeze(['pending', 'approved', 'rejected']);
 
