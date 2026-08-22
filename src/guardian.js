@@ -61,6 +61,8 @@ export const GUARDIAN_POLICY = Object.freeze({
   GLOBAL_BUDGET_EXHAUSTION_RATIO: 1.0, // spent/limit — a global emergency condition
   AGENT_BUDGET_WARNING_RATIO: 0.9, // an early-warning throttle, below full exhaustion
   SOFT_FREEZE_COOLDOWN_MS: 15 * 60 * 1000, // 15 minutes; a placeholder duration, not tuned against real traffic
+  MODEL_RESOURCE_FAILURE_WINDOW: 5, // M13 — repeated resource-governor denials/failures for one agent
+  MODEL_RESOURCE_FAILURE_THRESHOLD: 3,
 });
 
 export const GUARDIAN_REASON = Object.freeze({
@@ -70,6 +72,7 @@ export const GUARDIAN_REASON = Object.freeze({
   RETRY_SPIKE: 'RETRY_SPIKE',
   GLOBAL_BUDGET_EXHAUSTED: 'GLOBAL_BUDGET_EXHAUSTED',
   AGENT_BUDGET_WARNING: 'AGENT_BUDGET_WARNING',
+  MODEL_RESOURCE_FAILURE_SPIKE: 'MODEL_RESOURCE_FAILURE_SPIKE', // M13
 });
 
 /**
@@ -194,6 +197,27 @@ export function createGuardian({ store, audit, clock, policy = GUARDIAN_POLICY }
     return { imposed: false };
   }
 
+  // ── 7. repeated model resource-governor failures (M13) ────────────────
+  //
+  // Reads src/resource-governor.js's own `model.governor` audit events —
+  // no new observation channel, the same "evidence is the audit log"
+  // discipline every other policy here already follows. The Governor
+  // enforces resource ceilings; Guardian is what may act on a PATTERN of
+  // them being hit, exactly the division of responsibility M13's own
+  // directive draws.
+  function evaluateModelResourceFailures(agent_slug) {
+    const window = recent('model.governor', 'agent_slug', agent_slug, policy.MODEL_RESOURCE_FAILURE_WINDOW);
+    const failures = window.filter((r) => r.status === 'failed').length;
+    writeAudit('guardian.check', { check: 'model_resource_failures', target_id: agent_slug, window: window.length, failures });
+    if (failures >= policy.MODEL_RESOURCE_FAILURE_THRESHOLD) {
+      return impose({
+        scope: 'agent', target_id: agent_slug, reason: GUARDIAN_REASON.MODEL_RESOURCE_FAILURE_SPIKE,
+        detail: `${failures}/${window.length} recent model-resource calls failed`,
+      });
+    }
+    return { imposed: false };
+  }
+
   /** Every tree/workflow id Guardian has ever observed in the audit log —
    * it has no other way to enumerate workflows, since (per D25) workflow
    * records live in workflow.js's own closure, not in store. */
@@ -213,6 +237,7 @@ export function createGuardian({ store, audit, clock, policy = GUARDIAN_POLICY }
       results.push({ check: 'agent_failure_rate', target_id: agent.slug, ...evaluateAgentFailureRate(agent.slug) });
       results.push({ check: 'authorization_denials', target_id: agent.slug, ...evaluateAuthorizationDenials(agent.slug) });
       results.push({ check: 'agent_budget_warning', target_id: agent.slug, ...evaluateAgentBudgetWarning(agent.slug) });
+      results.push({ check: 'model_resource_failures', target_id: agent.slug, ...evaluateModelResourceFailures(agent.slug) });
     }
     for (const treeId of knownWorkflowIds()) {
       results.push({ check: 'workflow_failure_rate', target_id: treeId, ...evaluateWorkflowFailureRate(treeId) });
@@ -230,5 +255,6 @@ export function createGuardian({ store, audit, clock, policy = GUARDIAN_POLICY }
     evaluateRetrySpike,
     evaluateGlobalBudget,
     evaluateAgentBudgetWarning,
+    evaluateModelResourceFailures,
   };
 }

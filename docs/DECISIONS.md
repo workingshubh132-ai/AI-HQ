@@ -1079,6 +1079,113 @@ deliberately-scoped future milestone, not two independent oversights.
 
 ---
 
+## D30 — The resource governor: a real budget hierarchy, requiring no paid API to prove
+
+Decided 2026-08-21 (Milestone 13).
+
+`src/resource-governor.js` closes a gap D24 named and left open: model-call
+spend was tracked only per `(provider_id, model_id)` pair — no per-agent,
+per-workflow, or per-task ceiling existed anywhere. The governor adds
+exactly that: `GLOBAL → AGENT → WORKFLOW → TASK`, each level reserved
+before a call and settled after, wrapping `async-model-runtime.js`
+(M12) rather than re-implementing what it already governs — input/output
+size, provider:model budget, retry ceiling, timeout all still apply,
+unchanged, underneath this file.
+
+**"A child cannot exceed its parent" is a call-time property, not a
+configuration-time one.** No code anywhere validates that a workflow's
+configured ceiling is `<=` its agent's — instead, every level is checked
+independently on every single call, so whichever ceiling is tightest is
+the one that actually binds, regardless of what number any other level
+was configured with. Tests 256/257 prove this directly: a workflow or
+task configured with a deliberately huge ceiling is still stopped the
+moment its agent or workflow parent is exhausted. This is simpler than
+enforcing an ordering invariant at configuration time and cannot drift
+out of sync with it, because there is no separate invariant to drift
+from.
+
+**Reservation happens synchronously, which is what makes concurrent
+reservations safe without a lock.** `invoke()` reserves at every
+applicable level, in one synchronous pass, before the single `await` in
+the whole function. Two overlapping `invoke()` calls cannot interleave
+their reservation step — nothing yields control between the check and
+the mutation that follows it, a direct consequence of JavaScript's
+single-threaded event loop, the same property that already made
+router.js's concurrency reservations (M9) safe. Test 266 proves it: 12
+truly concurrent calls against a budget sized for exactly 3 succeed
+exactly 3 times, never more.
+
+**Estimated vs. actual, never fabricated.** The reservation amount is
+always the model's own declared `max_cost_per_call` — a real worst-case
+ceiling every provider must declare, never a guess this file invents.
+`usage_status` is `'ACTUAL'` only when the provider returned finite,
+non-negative `input_units`/`output_units`; otherwise it is `'ESTIMATED'`
+and the charge falls back to that same worst-case ceiling. This
+uncovered a real, pre-existing bug in `async-model-runtime.js` itself
+(not merely in the governor wrapping it): `cost = usage.input_units * ...`
+had no validation at all — a provider reporting a negative or `NaN`
+`input_units` would poison `budget.spent` with `NaN` permanently, after
+which the budget's own `>` comparison against that `NaN` is `false`
+forever, silently defeating the provider:model budget check for the rest
+of the process. A provider reporting no `usage` field at all would throw
+an uncaught `TypeError`. Fixed at the source with a new exported
+`sanitizeUsageUnits()` — reused by the governor rather than
+re-implemented, so both files agree on what "impossible usage" means.
+Confirmed inert for every valid-usage path: the full 18-test
+`async-model-runtime.test.js` suite from M12 passes byte-identical.
+
+**Retries do not multiply the reservation.** The retry loop lives
+entirely inside `async-model-runtime.js`'s single `invokeModel()` call;
+the governor reserves once per `invoke()`, calls that once, and settles
+once — internal retries are invisible to the reservation accounting by
+construction, not by a check that could be removed. Test 260 proves a
+model that fails once and succeeds on retry completes within a budget
+sized for exactly one worst-case reservation, and that a *second*,
+independent governor call correctly needs its own fresh reservation.
+
+**Agents and models cannot raise their own limits, because nothing reads
+a limit from the request.** Every ceiling lives in the governor's own
+closure, set only through `configure*Budget()` — never through any field
+on the `request` object a handler supplies. Test 255 proves a request
+smuggling `budget_limit: Infinity` and `max_cost_per_call: 0` changes
+nothing about what is actually charged or permitted.
+
+**Guardian gained one new policy, `evaluateModelResourceFailures`,
+reading the governor's own `model.governor` audit events — no new
+observation channel, the same discipline every existing Guardian policy
+already follows.** The Governor enforces; Guardian may act on a pattern
+of enforcement. Mutation-tested identically to Guardian's other
+policies.
+
+**Built and fully proven without one paid API call.** Every test in
+`resource-governor.test.js` runs against deterministic, synchronous-
+result mock providers (`tests/fixtures-mock-scenarios.js`) — success,
+oversized output, oversized input, timeout, retryable and
+non-retryable failure, valid/invalid/absent usage, high cost. These are
+explicitly labeled TEST CONDITIONS, never presented as real model
+behavior. The one test touching `provider-anthropic.js` (test 267)
+proves the real, current, unmocked behavior with no key configured:
+the call fails closed with `RETRY_CEILING_EXCEEDED` (the real provider's
+own declared retry count, exhausted against the same
+"ANTHROPIC_API_KEY is not configured" error every attempt) and every
+reservation it made is fully released — not `PROVIDER_ERROR` in
+isolation, which is what M12's narrower test proved before this
+milestone composed it with the full governed retry pipeline for the
+first time. No real network call was made. This project's own internal
+session credential was not read, inspected, or repurposed — doing so
+would have been exactly the credential misuse this codebase exists to
+prevent, not an acceptable substitute for "no key available."
+
+**What this milestone deliberately does not do.** It does not wire the
+governor into the live synchronous system — `runtime.js`'s `callModel`
+still calls the synchronous `model-runtime.js` directly, unchanged; that
+remains blocked on the same async conversion D28 and D29 already named.
+It does not add a lift/refund path beyond normal settlement, and it does
+not touch `broker.js`, `validator.js`, `runtime.js`, `router.js`, or
+`workflow.js` at all.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

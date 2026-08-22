@@ -168,14 +168,41 @@ export function createAsyncModelRuntime({ registry, audit, clock, modelBudgets =
       }
     }
 
-    // 7 — charge for the actual call, only now that it succeeded
-    const cost = raw.usage.input_units * model.cost_per_input_unit + raw.usage.output_units * model.cost_per_output_unit;
+    // 7 — charge for the actual call, only now that it succeeded. A
+    // provider reporting missing, negative, or non-numeric usage (M13
+    // adversarial scenario: "impossible/invalid usage") must never reach
+    // the budget ledger as-is — NaN or a negative number here would
+    // silently corrupt `budget.spent` forever (NaN poisons every future
+    // `>` comparison to `false`, permanently defeating the budget check).
+    // Fall back to the model's own declared worst-case ceiling instead —
+    // never less conservative than trusting bad data, and distinguishable
+    // from a real measurement via `usage_status`.
+    const inputUnits = sanitizeUsageUnits(raw.usage?.input_units);
+    const outputUnits = sanitizeUsageUnits(raw.usage?.output_units);
+    const usageValid = inputUnits !== null && outputUnits !== null;
+    const cost = usageValid
+      ? inputUnits * model.cost_per_input_unit + outputUnits * model.cost_per_output_unit
+      : model.max_cost_per_call;
     budget.spent += cost;
 
-    return settle('ok', MODEL_REASON.OK, { output: raw.output, usage: raw.usage, cost, attempts });
+    return settle('ok', MODEL_REASON.OK, {
+      output: raw.output,
+      usage: usageValid ? raw.usage : null,
+      usage_status: usageValid ? 'ACTUAL' : 'ESTIMATED',
+      cost,
+      attempts,
+    });
   }
 
   return { invokeModel };
+}
+
+/** A finite, non-negative usage figure, or null. Exported so
+ * resource-governor.js (M13) reuses the identical validation instead of
+ * redefining it — both files must agree on what "impossible/invalid
+ * usage" means. */
+export function sanitizeUsageUnits(v) {
+  return Number.isFinite(v) && v >= 0 ? v : null;
 }
 
 class TimeoutError extends Error {}
