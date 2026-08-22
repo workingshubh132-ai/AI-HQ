@@ -986,6 +986,99 @@ not a mock.
 
 ---
 
+## D29 — A real model provider exists, credential-isolated, deliberately not yet live
+
+Decided 2026-08-21 (Milestone 12).
+
+`src/provider-anthropic.js` is a genuine, production-quality provider
+definition — the same shape `providers.js`'s registry already expects —
+that calls the real Anthropic API through the official
+`@anthropic-ai/sdk`, per this project's own Claude API skill guidance
+(SDK over raw HTTP; never an OpenAI-compatible shim). `ANTHROPIC_API_KEY`
+is read from `process.env` in exactly one place — inside `invoke()`, at
+call time — and goes nowhere else: not onto the returned envelope, not
+into an audit record, not into `model_config`. Test 247 asserts the
+source references that variable exactly once; test 233 confirms an
+existing protection independently blocks the more direct attack anyway —
+`validator.js`'s `model_config` check already rejects any field beyond
+`provider_id`/`model_id` (added in M7, not touched here), so an agent
+version declaring `api_key: "sk-..."` in its own configuration was
+already refused before this milestone existed.
+
+**No real API credential was available in this environment, and none was
+fabricated to pretend otherwise.** `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`
+are unset; no `ant` CLI or OAuth profile is present. This container does
+carry Claude Code's own internal session credential (visible as
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` in the environment) — that
+credential authenticates *this coding session's own inference calls* to
+Anthropic; it is not a general-purpose API key issued for AI-HQ's
+application code to consume, and reading or repurposing it would be
+exactly the kind of credential misuse this entire codebase exists to
+prevent, not an acceptable shortcut around "no credentials available."
+"real API credentials" is one of the directive's own named external
+boundaries — reached honestly here, not routed around. Test 246 proves
+the actual, current, unmocked behavior: `invoke()` throws
+`"ANTHROPIC_API_KEY is not configured"` — a real test of real code, not
+a stand-in for one. Test 248 stubs the SDK's transport layer (patching
+`Messages.prototype.create`, restored after) to prove this file parses a
+well-formed response into `{status, output, usage}` correctly — labeled,
+in its own test name and in this file's header, as parsing-only proof,
+never presented as evidence the real API was called.
+
+**`invoke()` is necessarily async, which means it is not usable through
+model-runtime.js's synchronous pipeline — the same structural fact D28
+already established for the storage layer, now true of the model layer
+too.** `runtime.js`'s `callModel` wrapper invokes
+`modelRuntime.invokeModel(...)` synchronously, with no `await`, exactly
+as every handler built against it since M7 expects. `src/async-model-runtime.js`
+mirrors `model-runtime.js`'s governed pipeline exactly — same
+`MODEL_REASON` codes (imported, not redefined), same input/output size
+ceilings, same budget precheck, same clamped retry ceiling
+(`MAX_RETRY_CEILING = 3`, independently re-declared and independently
+mutation-tested here, not assumed inherited) — with `await` throughout,
+plus one genuine capability improvement a synchronous mock cannot offer:
+real preemptive timeout via `Promise.race` against a timer, rather than
+model-runtime.js's honestly-documented "measure elapsed time after the
+call already returned." Test 241 proves this directly — the call returns
+before the deliberately slow provider's own promise has resolved, not
+merely after enough elapsed time is reported.
+
+**`system` (instructions) is new surface, added only to the async path.**
+It is optional, validated only for being a string when present, and
+passed through to `invoke({input, system})` untouched — exactly as
+untrusted and inert as `input` itself. `model-runtime.js` (the sync path,
+still the only one wired into the live system) was not touched to add
+it, keeping that file's diff for this milestone at zero lines.
+
+**`budgetKey` was exported from `model-runtime.js`, not redefined.** The
+one three-line change to that file in this milestone — reused by the new
+async runtime so the two budget maps' key format can never silently
+drift apart. Confirmed inert: the full 31-test `model-runtime.test.js`
+suite passes byte-identical before and after.
+
+**Real, non-fictional pricing, because this is a real provider.** Unlike
+`providers.js`'s mock (deliberately fictional COST_UNITS, "never real
+currency"), `provider-anthropic.js` declares actual published per-token
+USD rates for `claude-opus-5` — test 249 asserts they are real
+fractional-cent figures, not placeholder integers, and that output costs
+more than input, matching the real pricing shape. "Units" still means
+`JSON.stringify(...).length`, the same measurement convention
+`model-runtime.js` already uses for the mock — not real tokens; a real
+tokenizer remains out of scope, an explicit, named limitation rather
+than an implied one.
+
+**What this milestone deliberately does not do.** No handler, agent, or
+task in the live system can reach `provider-anthropic.js` today —
+nothing calls it except this milestone's own tests, by design. No
+real network call was ever made or claimed to have been made. Wiring a
+real provider into live agent execution requires the same async
+conversion of the entire call chain D28 already deferred for
+persistence, now doubly true once both the storage layer and the model
+layer need it — reinforcing that this is a genuinely separate,
+deliberately-scoped future milestone, not two independent oversights.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

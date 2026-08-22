@@ -1,71 +1,42 @@
 /**
- * MODEL RUNTIME
+ * ASYNC MODEL RUNTIME (Milestone 12)
  *
- * The governed path from a handler's request to a provider's response.
- * Every check here runs BEFORE the provider is called or the result is
- * trusted; none of them run inside the Broker, and none of them decide
- * whether a TOOL may execute — that remains entirely the Broker's job.
+ * The exact same governed pipeline model-runtime.js already runs
+ * (validate → provider/model lookup → input size limit → budget
+ * precheck → bounded retry → output size limit → output contract →
+ * charge → audit) — mirrored here with `await`, for providers whose
+ * `invoke()` returns a Promise because it makes a real network call.
+ * Every MODEL_REASON code, every ceiling, every check is reused from
+ * model-runtime.js, not reinvented — this file only exists because
+ * "await a Promise" cannot be retrofitted onto a function every existing
+ * caller invokes synchronously without awaiting it.
  *
- * ── THE BOUNDARY THIS FILE EXISTS TO ENFORCE ────────────────────────────
+ * NOT wired into runtime.js's `callModel` — that wrapper calls
+ * `modelRuntime.invokeModel(...)` synchronously, exactly like every
+ * handler built against it (M5–M11) expects. Making this the live path
+ * requires handlers themselves to become async, and runtime.js to await
+ * them — the identical class of change DECISIONS.md D28 already deferred
+ * for postgres-store.js, extended here to the model layer. See D29.
  *
- * agent → runtime → MODEL RUNTIME → provider → structured result
- *                        │
- *                        └─→ validated, budgeted, bounded
+ * ── system instructions ─────────────────────────────────────────────
  *
- * agent → runtime → Broker → tool          (unchanged, separate path)
- *
- * invokeModel() has no reference to a Broker, to store's mutation methods
- * (setActiveVersion, setLifecycleState, addFreeze, chargeBudgets on tool
- * budgets), to agents.js, or to anything that grants clearance, approves a
- * version, or authorizes an action. It cannot bypass the Broker because it
- * cannot reach it — this is a structural fact, checked by
- * tests/model-runtime.test.js, not a promise kept by convention.
- *
- * A model's output is data. If a handler chooses to hand that data to
- * callTool() as if it were an instruction, the Broker evaluates it exactly
- * as it would any other payload — on the agent's actual clearance, actual
- * allowlist, actual approval state. The model saying "approved" changes
- * nothing. See tests/model-runtime.test.js's adversarial tests.
- *
- * ── WHAT "TIMEOUT" MEANS HERE, HONESTLY ─────────────────────────────────
- *
- * The mock provider is synchronous. This file measures elapsed time via
- * the injected clock and classifies a call that took longer than the
- * model's configured ceiling as TIMEOUT, after the fact. It does not, and
- * currently cannot, preemptively cancel a call in progress — that requires
- * a genuinely asynchronous, cancellable provider (AbortController or
- * equivalent), which does not exist yet. Do not describe this as
- * preemptive cancellation. See DECISIONS.md D24.
+ * `request.system`, if present, is passed straight through to the
+ * provider's `invoke({input, system})` — untouched, unvalidated beyond
+ * being a string, exactly as `input` itself is untouched. Neither this
+ * file nor the provider treats it as anything but data handed to the
+ * model; it grants no authority and is not consulted by any check below.
  *
  * Constitution: sections 13, 22, 23.
  */
 
 import { checkContract } from './contracts.js';
+import { MODEL_REASON, budgetKey } from './model-runtime.js';
 
-export const MODEL_REASON = Object.freeze({
-  OK: 'OK',
-  INVALID_REQUEST: 'INVALID_REQUEST',
-  UNKNOWN_PROVIDER: 'UNKNOWN_PROVIDER',
-  UNKNOWN_MODEL: 'UNKNOWN_MODEL',
-  INPUT_LIMIT_EXCEEDED: 'INPUT_LIMIT_EXCEEDED',
-  OUTPUT_LIMIT_EXCEEDED: 'OUTPUT_LIMIT_EXCEEDED',
-  BUDGET_MISSING: 'BUDGET_MISSING',
-  BUDGET_EXCEEDED: 'BUDGET_EXCEEDED',
-  TIMEOUT: 'TIMEOUT',
-  RETRY_CEILING_EXCEEDED: 'RETRY_CEILING_EXCEEDED',
-  PROVIDER_ERROR: 'PROVIDER_ERROR',
-  OUTPUT_CONTRACT_VIOLATION: 'OUTPUT_CONTRACT_VIOLATION',
-});
+export { MODEL_REASON };
 
-/** No request may ask for more retries than this, however it is configured. */
+/** Same clamp as model-runtime.js — no caller may request more, however
+ * the request or the model's own config asks for it. */
 const MAX_RETRY_CEILING = 3;
-
-/** Exported so async-model-runtime.js (M12) reuses the identical key
- * shape rather than redefining it — the two budget maps are never the
- * same Map instance, but the key format they use must never drift. */
-export function budgetKey(providerId, modelId) {
-  return `${providerId}:${modelId}`;
-}
 
 /**
  * @param {object} deps
@@ -73,15 +44,11 @@ export function budgetKey(providerId, modelId) {
  * @param {object} deps.audit
  * @param {() => number} deps.clock
  * @param {{provider_id:string, model_id:string, limit:number}[]} [deps.modelBudgets]
- *   Provider/model-level spend ceilings, in COST_UNITS. This is the one
- *   budget dimension M7 implements. Per-task and per-agent model-spend
- *   accounting are not yet wired to this layer — recorded as a limitation
- *   in DECISIONS.md D24, not silently implied by this parameter's name.
  */
-export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }) {
+export function createAsyncModelRuntime({ registry, audit, clock, modelBudgets = [] }) {
   const budgets = new Map(modelBudgets.map((b) => [budgetKey(b.provider_id, b.model_id), { limit: b.limit, spent: 0 }]));
 
-  function invokeModel(request) {
+  async function invokeModel(request) {
     const startedAt = clock();
 
     const settle = (status, reason, patch = {}) => {
@@ -110,6 +77,9 @@ export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }
     if (request.input === undefined) {
       return settle('failed', MODEL_REASON.INVALID_REQUEST, { output: null, error: 'input is required' });
     }
+    if (request.system !== undefined && typeof request.system !== 'string') {
+      return settle('failed', MODEL_REASON.INVALID_REQUEST, { output: null, error: 'system, if present, must be a string' });
+    }
 
     // 1 — provider and model must be registered. Fail closed on either.
     const provider = registry.getProvider(request.provider_id);
@@ -125,7 +95,6 @@ export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }
     }
 
     // 3 — budget pre-check, using the model's declared worst-case cost.
-    // Charged for real only after a successful call; a denial spends nothing.
     const key = budgetKey(request.provider_id, request.model_id);
     const budget = budgets.get(key);
     if (!budget) return settle('failed', MODEL_REASON.BUDGET_MISSING, { output: null });
@@ -136,9 +105,10 @@ export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }
       });
     }
 
-    // 4 — bounded retry loop. The ceiling is clamped regardless of what the
-    // request or the model config asks for: no caller can request unlimited
-    // retries.
+    // 4 — bounded retry loop, with GENUINE preemptive timeout: a real
+    // async provider can actually be raced against a timer and abandoned
+    // (its eventual resolution is simply never awaited further), unlike
+    // the synchronous mock model-runtime.js measures after the fact.
     const maxAttempts = 1 + Math.min(
       request.max_retries ?? model.default_max_retries,
       MAX_RETRY_CEILING,
@@ -153,15 +123,24 @@ export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }
       attempts++;
       const t0 = clock();
       try {
-        raw = model.invoke({ input: request.input });
+        raw = await withTimeout(model.invoke({ input: request.input, system: request.system }), model.timeout_ms);
       } catch (err) {
-        lastReason = MODEL_REASON.PROVIDER_ERROR;
-        lastDetail = String(err.message);
+        if (err instanceof TimeoutError) {
+          lastReason = MODEL_REASON.TIMEOUT;
+          lastDetail = `exceeded ${model.timeout_ms}ms ceiling`;
+        } else {
+          lastReason = MODEL_REASON.PROVIDER_ERROR;
+          lastDetail = String(err.message);
+        }
         raw = null;
         continue;
       }
       const elapsed = clock() - t0;
       if (elapsed > model.timeout_ms) {
+        // Belt and suspenders: the provider resolved, but too slowly by
+        // the injected clock's account (matters for deterministic tests
+        // using a fake clock, where withTimeout's real setTimeout cannot
+        // observe the same fictional time).
         lastReason = MODEL_REASON.TIMEOUT;
         lastDetail = `${elapsed}ms > ${model.timeout_ms}ms ceiling`;
         raw = null;
@@ -181,9 +160,7 @@ export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }
       return settle('failed', MODEL_REASON.OUTPUT_LIMIT_EXCEEDED, { output: null, attempts, detail: `${outputSize} > ${model.max_output_units}` });
     }
 
-    // 6 — output contract, if the caller declared one. A model's output is
-    // untrusted data until it passes this; failing here never becomes an
-    // authorization decision and never reaches callTool on its own.
+    // 6 — output contract, if the caller declared one.
     if (request.output_contract) {
       const contractError = checkContract(request.output_contract, raw.output);
       if (contractError) {
@@ -199,4 +176,15 @@ export function createModelRuntime({ registry, audit, clock, modelBudgets = [] }
   }
 
   return { invokeModel };
+}
+
+class TimeoutError extends Error {}
+
+function withTimeout(promise, ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(`timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
