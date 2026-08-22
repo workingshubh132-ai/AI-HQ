@@ -2066,6 +2066,121 @@ credential, no paid API call.
 
 ---
 
+## D38 — Provider-ready content generation: a standalone layer, five deterministic providers, and one honest compatibility fix
+
+Decided 2026-08-22 (Milestone 21).
+
+`src/providers/` is a new, standalone foundation for content generation
+across five categories (text, image, audio, video, subtitle), built the
+same way M19's artifact system was built before M20 wired it in: proven
+correct on its own, not yet connected to live execution. `broker.js`,
+`runtime.js`, `validator.js`, `guardian.js`, `approval-engine.js`,
+`router.js`, `workflow.js`, and `execution-coordinator.js` are all
+confirmed unchanged (`git diff --stat` lists only new files).
+
+**Why providers are untrusted, structurally, not by convention.**
+`invoke.js` holds no reference to the Broker, Guardian, the Approval
+Engine, or any store-mutation/lifecycle method — checked directly (test
+504) by grepping every file under `src/providers/`. A provider's output
+is validated for SHAPE (`contracts.js`'s per-category output check) and
+nothing else; no field is ever inspected for meaning. A deterministic
+test provider whose output is shaped exactly like an authorization
+decision (`approved: true, clearance: 'RED', remove_freeze: true,
+budget_override: 999999, tool: 'fake.transfer_funds', approval_id:
+'forged'`) produces a perfectly valid artifact — the DATA is fine — and
+changes nothing else: the real agent's clearance and lifecycle state are
+unchanged, no freeze exists, and an independent, real `broker.execute()`
+call for the named tool still denies it (test 502), proving this was
+never consulted by anything in this milestone, not merely asserting it.
+
+**Why deterministic providers, and why they say so loudly.** The user
+has no budget for a paid API today. Every provider registered in this
+milestone is a pure, synchronous, same-input-same-output function
+producing clearly synthetic fixture content — an explicit `[SYNTHETIC
+FIXTURE]` marker in text output, a `synthetic: true` flag and a `note`
+field in media metadata, an opaque `fixture://` URI scheme for
+`content_ref` that nothing in this codebase ever resolves. Deterministic
+reproducibility itself is tested directly (test 510): every provider
+produces byte-identical output for byte-identical input across
+independent calls.
+
+**Why Groq is not connected, and what "ready" actually means today.**
+No Groq adapter exists; none is claimed to. `docs/PROVIDERS.md` §3
+documents the exact shape a future one would take, using
+`provider-anthropic.js` (M12) — a real, tested, already-working adapter
+for a DIFFERENT real provider — as the concrete, proven precedent: read
+the credential inside `invoke()` only, register it as one more provider
+entry, consume it through an async-capable invoker once one exists.
+"Groq-readiness" today is honestly structural rather than proven by a
+working integration: nothing currently depends on `src/providers/` at
+all, so the claim "adding Groq wouldn't require touching broker.js/
+validator.js/etc." is trivially true (there is no dependency edge to
+break) rather than a tested guarantee — stated plainly as such, not
+oversold.
+
+**Why Claude API is not required.** Nothing in this milestone, or
+anything it depends on, reads `ANTHROPIC_API_KEY` or any credential —
+swept directly (test 514) across every file under `src/providers/`. The
+entire test suite (this milestone's 31 new tests, and the full existing
+546) runs with zero environment configuration.
+
+**A real compatibility gap was found and fixed while composing
+`invoke.js` with the EXISTING, unmodified `resource-governor.js` — not
+a design flaw in either file, but a genuine missing piece.**
+`resource-governor.js`'s reservation math reads `model.max_cost_per_call`
+directly (`const amount = model.max_cost_per_call`); this milestone's
+registry contract, correctly, does not require that field (a
+deterministic provider has no real per-call cost to declare). Composing
+the two without it meant `amount` was `undefined`, and `undefined`
+propagating through `spent + reserved + amount > limit` evaluates to
+`NaN > limit`, which is always `false` — a reservation that always
+"succeeds," silently defeating budget enforcement rather than failing
+closed. Found immediately by the milestone's own test (a deliberately
+zero-budget task that should have been rejected wasn't). Fixed
+honestly: each deterministic provider's model definition now declares
+`max_cost_per_call: 0` — a real, true number (it genuinely costs
+nothing), not a placeholder chosen to make a check pass. This also
+surfaced the correct framing for "budget exhaustion" testing at all: a
+genuinely zero-cost provider cannot be driven to exhaust a MONETARY
+budget by definition, so test 499 proves exhaustion via
+`resource-governor.js`'s OTHER, independent ceiling — `MAX_CALLS_PER_TASK`
+— which is real, already-enforced, and completely orthogonal to cost.
+
+**Retry-safety is a deliberately stricter policy than
+`model-runtime.js`'s original design, not an oversight.**
+`model-runtime.js` (M6/M7) retries any failure up to its ceiling.
+`RETRYABLE_PROVIDER_REASONS` (this milestone) explicitly allowlists only
+three transient categories — timeout, rate-limited, unavailable — and a
+test (512) proves the set can never contain anything
+authorization/approval/lifecycle/Guardian-shaped. This matches the M21
+directive's own explicit instruction ("never retry: authorization
+failures, approval failures, lifecycle failures, Guardian freezes,
+malformed requests, invalid configuration, invalid contracts") more
+strictly than the pre-existing text pipeline does — a deliberate,
+narrower policy for this new layer, not a claim that the older one is
+wrong for what it already does.
+
+**Provenance is re-derived, never read from provider output — proven
+against forged output specifically, not just forged requests.**
+`artifact-bridge.js`'s `extractContent()` copies only the exact, named
+fields each category's contract defines — never the whole `output`
+object verbatim — so a provider response smuggling `agent_id`,
+`version_id`, `registry_sha`, `workflow_id`, `task_id`, `artifact_id`,
+or `provenance` (test 501, using literal field names an adversarial
+provider might try) never reaches the artifact request the bridge
+builds, regardless of what the (untrusted) provider chose to return.
+
+**What this milestone deliberately does not do.** No real network
+provider, no live/async invocation path (nothing needs one — every
+current provider is synchronous), no wiring into `runtime.js`'s handler
+execution (the same "prove standalone first" discipline M19 followed —
+a future milestone's job, exactly as M20 was for artifacts), no blob
+storage behind `content_ref` (M19's own deferred boundary, unchanged),
+no new dependency, no credential, no network primitive, no paid API
+call, no token/quota bypass mechanism of any kind.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
