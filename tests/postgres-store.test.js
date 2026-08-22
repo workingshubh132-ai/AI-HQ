@@ -214,12 +214,94 @@ if (!PG_TEST_URL) {
 
   test('231. the Postgres adapter files contain no hardcoded credential and no non-local network host', async () => {
     const { readFileSync } = await import('node:fs');
-    for (const f of ['../src/postgres-store.js', '../src/postgres-audit.js', '../scripts/migrate.mjs']) {
+    for (const f of ['../src/postgres-store.js', '../src/postgres-audit.js', '../scripts/migrate.mjs', '../supabase/migrations/0004_agent_versions_immutability_trigger.sql']) {
       const src = readFileSync(new URL(f, import.meta.url), 'utf8');
       for (const term of ['password', 'PGPASSWORD', 'sk-', 'AKIA', '://root:', 'amazonaws.com', 'supabase.co']) {
         assert.ok(!src.toLowerCase().includes(term.toLowerCase()), `${f} must not contain ${term}`);
       }
     }
+  });
+
+  // ── database-level immutability trigger (M16) ────────────────────────
+  //
+  // tests/storage-contract.test.js already proves addAgentVersion() throws
+  // on a duplicate version_id, on both stores. That is INSERT-time
+  // protection via the primary key. These tests prove the SEPARATE
+  // guarantee migration 0004 adds — an EXISTING row cannot be changed or
+  // removed by ANY SQL statement, not merely by "no application method
+  // exists to try it." Talks to `pool` directly, deliberately bypassing
+  // src/postgres-store.js entirely, because the point is that the
+  // database itself refuses this, independent of any application code.
+
+  test('317. an existing agent_versions row survives a direct UPDATE attempt — the database rejects it, not application code', async () => {
+    await freshTables();
+    await pool.query(
+      `insert into public.agent_versions (version_id, agent_id, version, purpose, state, clearance, created_at)
+       values ('immutable-test@1.0.0', 'immutable-test', '1.0.0', 'fixture', 'draft', 'GREEN', 0)`,
+    );
+    await assert.rejects(
+      async () => pool.query("update public.agent_versions set clearance = 'YELLOW' where version_id = 'immutable-test@1.0.0'"),
+      /agent_versions is immutable/,
+    );
+    const { rows } = await pool.query("select clearance from public.agent_versions where version_id = 'immutable-test@1.0.0'");
+    assert.equal(rows[0].clearance, 'GREEN', 'the row must be byte-for-byte unchanged after the rejected UPDATE');
+  });
+
+  test('318. an existing agent_versions row survives a direct DELETE attempt — the database rejects it, not application code', async () => {
+    await freshTables();
+    await pool.query(
+      `insert into public.agent_versions (version_id, agent_id, version, purpose, state, clearance, created_at)
+       values ('immutable-test-2@1.0.0', 'immutable-test-2', '1.0.0', 'fixture', 'draft', 'GREEN', 0)`,
+    );
+    await assert.rejects(
+      async () => pool.query("delete from public.agent_versions where version_id = 'immutable-test-2@1.0.0'"),
+      /agent_versions is immutable/,
+    );
+    const { rows } = await pool.query("select 1 from public.agent_versions where version_id = 'immutable-test-2@1.0.0'");
+    assert.equal(rows.length, 1, 'the row must still exist after the rejected DELETE');
+  });
+
+  test('319. the UPDATE/DELETE rejection is a distinct error from the duplicate-INSERT rejection — the two protections are independently provable', async () => {
+    await freshTables();
+    await pool.query(
+      `insert into public.agent_versions (version_id, agent_id, version, purpose, state, clearance, created_at)
+       values ('immutable-test-3@1.0.0', 'immutable-test-3', '1.0.0', 'fixture', 'draft', 'GREEN', 0)`,
+    );
+    const duplicateInsert = await pool.query(
+      `insert into public.agent_versions (version_id, agent_id, version, purpose, state, clearance, created_at)
+       values ('immutable-test-3@1.0.0', 'immutable-test-3', '1.0.0', 'fixture', 'draft', 'GREEN', 0)`,
+    ).catch((err) => err);
+    assert.equal(duplicateInsert.code, '23505', 'duplicate INSERT is a unique_violation, exactly as before this migration');
+
+    const rejectedUpdate = await pool.query("update public.agent_versions set clearance = 'YELLOW' where version_id = 'immutable-test-3@1.0.0'").catch((err) => err);
+    assert.equal(rejectedUpdate.code, '23000', 'UPDATE/DELETE is a distinct integrity_constraint_violation, from the new trigger');
+    assert.notEqual(rejectedUpdate.code, duplicateInsert.code, 'the two immutability protections are independently distinguishable, not the same mechanism firing twice');
+  });
+
+  test('320. addAgentVersion() through the normal application path is completely unaffected by the trigger', async () => {
+    await freshTables();
+    const store = createPostgresStore(pool);
+    const v = await store.addAgentVersion({
+      version_id: 'normal-path@1.0.0', agent_id: 'normal-path', version: '1.0.0', purpose: 'fixture',
+      state: 'approved', clearance: 'GREEN', allowed_tools: [], created_at: 0,
+    });
+    assert.equal(v.version_id, 'normal-path@1.0.0');
+    const fetched = await store.getAgentVersion('normal-path@1.0.0');
+    assert.equal(fetched.clearance, 'GREEN');
+  });
+
+  test('321. TRUNCATE still works for bulk test-fixture reset — the trigger targets row-level mutation, not administrative reset', async () => {
+    // Row-level BEFORE triggers do not fire on TRUNCATE in Postgres by
+    // design — confirmed here explicitly rather than left implicit,
+    // because every other test in this suite depends on freshTables()'s
+    // TRUNCATE succeeding against this exact table.
+    await pool.query(
+      `insert into public.agent_versions (version_id, agent_id, version, purpose, state, clearance, created_at)
+       values ('truncate-test@1.0.0', 'truncate-test', '1.0.0', 'fixture', 'draft', 'GREEN', 0)`,
+    );
+    await freshTables();
+    const { rows } = await pool.query('select count(*)::int as n from public.agent_versions');
+    assert.equal(rows[0].n, 0, 'TRUNCATE must still be able to reset this table between tests');
   });
 
   after(async () => {

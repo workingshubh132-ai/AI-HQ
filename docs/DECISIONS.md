@@ -1363,6 +1363,90 @@ or a network primitive.
 
 ---
 
+## D33 — Persistence: M16 found M11 already complete; one real gap closed at the database level
+
+Decided 2026-08-22 (Milestone 16).
+
+Inspection going into M16 found that essentially the entire stated
+objective — a durable adapter satisfying the exact storage contract,
+tested against both implementations, with concurrency-safe idempotency,
+transaction-safe `updateTask`, a migration runner, health/startup
+validation, and a durable audit sink — was already real, already tested
+against a genuine local Postgres 16 instance, and already documented
+(D28), from Milestone 11. `tests/storage-contract.test.js` already runs
+every behavioral assertion (including the immutable-version-rejection
+test) against both `createMemoryStore()` and `createPostgresStore()`
+via one shared function. `tests/postgres-store.test.js` already proves
+the migration runner applies/skips/rolls-back correctly (tests 220-222),
+health and startup checks fail closed (223-226), and — critically — the
+exact concurrency guarantee the in-memory store's own header admits it
+cannot make: test 227 proves 25 simultaneous `claimIdempotency()` calls
+for one key resolve to exactly one winner, via a real unique-constraint
+INSERT race, not a mock. **The IDEMPOTENCY_IN_FLIGHT concern the M16
+directive named was already fixed in M11, not newly reachable here** —
+the fix (insert-not-upsert against a primary key) predates this
+milestone and needed no changes.
+
+**The one concrete, unaddressed gap: immutability was enforced only by
+"no method exists to call," not by the database itself.** `agent_
+versions.version_id` being a primary key stops a duplicate INSERT (the
+existing `23505` catch in `addAgentVersion()`), but a primary key does
+not stop an UPDATE or a DELETE of an existing row — nothing at the
+schema level prevented a future bug, a different service sharing the
+database, or a manual `psql` session from silently altering an
+already-persisted version's `clearance` or `allowed_tools`, the exact
+fields the Broker reads as security-authoritative. The M16 directive
+explicitly asks to "prefer a database-level constraint/trigger rather
+than relying only on application code" for this specific invariant.
+Migration `0004_agent_versions_immutability_trigger.sql` adds a `BEFORE
+UPDATE OR DELETE` trigger on `agent_versions` that unconditionally raises
+(SQLSTATE `23000`, distinguishable from the `23505` duplicate-insert
+path — test 319 proves both independently), for every role and every
+access path, not only the ones this codebase's own client happens to
+use. Tests 317/318 issue the UPDATE/DELETE directly against `pool`,
+deliberately bypassing `postgres-store.js` entirely, so the guarantee
+being tested is the database's, not the adapter's error handling.
+
+**Row-level triggers do not fire on `TRUNCATE` — verified, not assumed.**
+Every existing Postgres-backed test resets state between tests via
+`TRUNCATE ... agent_versions ...`. Before writing test 321, this was
+confirmed directly against the live local database (`psql`): a
+`BEFORE UPDATE OR DELETE FOR EACH ROW` trigger does not intercept
+`TRUNCATE`, so the new migration does not break the test harness's own
+cleanup mechanism — a genuine risk for this kind of change, checked
+empirically rather than hoped.
+
+**Mutation-tested by removing the migration file itself, not by editing
+application code.** With `0004_...sql` temporarily moved out of
+`supabase/migrations/`, a freshly created isolated test database (the
+existing per-file isolation pattern, `createIsolatedTestDatabase`) never
+receives the trigger, and tests 317-319 (and 231, which reads the file
+directly) failed exactly as expected; tests 320-321 correctly kept
+passing, since neither depends on the trigger existing. The migration
+was restored and the full suite (399 tests, Postgres configured; 357,
+offline) confirmed green again.
+
+**Scope was deliberately not widened to `audit_logs` or `freezes`.**
+Both are also documented as append-only, but by convention, not by a
+security invariant the M16 directive named specifically — its
+IMMUTABILITY section is about agent versions by name. Hardening those
+two tables the same way is a natural, low-risk follow-up, not done here
+under "only M16."
+
+**What this milestone deliberately does not do.** It does not touch
+`broker.js`, `runtime.js`, `validator.js`, `router.js`, `workflow.js`, or
+`guardian.js` — none of the security core needed to change, because
+nothing about the gap it closed was reachable from those files in the
+first place (there has never been an `updateAgentVersion` or
+`deleteAgentVersion` in the storage contract). It does not add a
+dependency, a credential, or an environment variable — `.env.example`
+already documented `AI_HQ_DATABASE_URL`/`AI_HQ_TEST_DATABASE_URL` with
+placeholders only, and needed no change. It does not wire
+`postgres-store.js` into the live synchronous system — that boundary
+(D28) is unchanged and was not in scope.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
