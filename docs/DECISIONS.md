@@ -2328,6 +2328,179 @@ primitive, paid API call, or quota-bypass mechanism of any kind.
 
 ---
 
+## D40 — The Content Factory: twelve real specialists, and a genuine gap `workflow.js`'s completion logic never anticipated
+
+Decided 2026-08-22 (Milestone 23).
+
+`src/content-factory-agents.js` (twelve DATA-defined agents, one
+adversarial fixture) and `src/content-factory-orchestrator.js` (the
+orchestration loop plus CEO-preparation read-only interface) produce a
+real, governed `CONTENT_PACKAGE` artifact graph from a single topic,
+executed entirely through the real router/workflow/execution-coordinator/
+runtime/provider/artifact-service/audit/Guardian chain. `broker.js`,
+`validator.js`, `guardian.js`, `approval-engine.js`, `router.js`,
+`workflow.js`, and `execution-coordinator.js` are all confirmed
+unchanged (`git diff --stat` lists only `src/artifacts.js` — one new
+enum entry — plus new files). `artifacts.js` gained `CONTENT_PACKAGE`
+the same way it already documents extending itself: a new entry plus a
+migration widening the matching Postgres CHECK constraint (0008,
+mirroring 0005's identical fix for `RUNTIME_STATE.DISABLED`).
+
+**A real architectural gap, found by actually trying to build this,
+not assumed away.** Twelve stages' true data-dependency critical path
+(research -> fact-check -> idea -> script -> hook -> audio -> subtitle
+-> video-plan -> quality-control -> publishing-package) is nine
+sequential hops long. M20's and M22's self-chaining pattern
+(`proposed_child_tasks`, each hop deepening the task tree by exactly
+one level via `parent_task_id: task.id`) can express at most
+`MAX_DEPTH` (4) sequential hops — this pipeline's critical path exceeds
+that by more than double, and no rearrangement of fan-out changes the
+critical path's own length, only how many INDEPENDENT branches share
+one depth level. Self-chaining could not fit this pipeline inside the
+existing, unmodified depth ceiling, full stop — not a design
+preference, a hard limit reached honestly and reported rather than
+routed around by weakening depth enforcement or merging stages into
+fewer, less-specialized agents.
+
+**The fix needed no relaxation of any limit.** `workflow.js`'s
+`depends_on` (existing since M8, used previously only for retry-safety
+bookkeeping) is completely orthogonal to `parent_task_id`/depth — a
+task may depend on any already-admitted task regardless of tree
+position. `content-factory-orchestrator.js` proposes every stage via
+`execution-coordinator.js`'s unmodified `proposeTask()` with
+`parent_task_id: null` (every task sits at depth 0 — proven directly,
+test 576) and a `depends_on` array expressing the REAL dependency
+graph. `MAX_DEPTH`, `MAX_FANOUT`, and `MAX_TOTAL_NODES` are none of
+them touched, weakened, or approached — the twelve-task run uses 12 of
+32 available nodes, at fan-out 0 (no parent-child relationship exists
+in this design at all), at depth 0 throughout. The ARTIFACT graph these
+same twelve tasks build is nine-plus levels deep (test 576) — task tree
+shape and artifact lineage shape remain deliberately decoupled, the
+same principle M20's own header states, satisfied through a different
+mechanism because this milestone's pipeline is wider than a single
+self-chain can express.
+
+**A second, genuine gap: `workflow.step()`'s completion detection
+assumes every future task is either already known or self-chained
+into existence within the SAME round.** Proposing stage N+1 requires
+stage N's real output (an artifact_id) — unknowable until N actually
+runs. But calling `workflow.step()`/`coordinator.runStep()` to run N
+ALSO recomputes the workflow's state immediately afterward: zero
+PENDING tasks (N+1 not proposed yet, since its input isn't known)
+reads as "nothing left to do," and the workflow transitions to
+COMPLETED — a state `addTask`/`proposeTask` then correctly refuse to
+reopen (`WORKFLOW_NOT_RUNNABLE`), by design, so a caller who does not
+know a workflow closed cannot silently keep writing to it. This is
+correct behavior for a self-chained workflow and the wrong signal for
+one whose remaining stages are proposed externally, one at a time, only
+once computed.
+
+**Fixed without touching `workflow.js`, `execution-coordinator.js`, or
+any other core file.** `proposeAndRunOne`/`proposeAndRunParallel`
+(`content-factory-orchestrator.js`) call `coordinator.proposeTask()`
+for admission (real router selection, real `workflow.addTask()`
+bookkeeping, unchanged) and then call `runtime.runTask()` DIRECTLY to
+execute — the exact same, already-public, unmodified function
+`workflow.step()` itself calls internally every round, just invoked
+once per stage by this file instead of once per round by `step()`.
+`router.release()` and `guardian.evaluate()` are called explicitly
+afterward, mirroring `runStep()`'s own
+`releaseTerminalReservations()`/Guardian cadence exactly, so
+concurrency accounting and Guardian's freeze behavior match a
+`step()`-driven run. `workflow.js`'s own `.state` field is left
+untouched by every intermediate stage — nothing calls `step()` until
+the very end, once every stage this run will ever propose is already
+terminal, at which point its zero-pending-means-COMPLETED logic is
+exactly correct and computes the real final state through the real,
+unmodified code path (test 571 and others confirm `workflow.state ===
+COMPLETED` after a full real run). No new orchestration engine was
+built; this is the SAME workflow engine, called in a pattern its own
+public API already supported but no prior milestone's caller needed.
+
+**Guardian freezes turned out to be caught even earlier than
+expected.** `router.js`'s own candidate-eligibility check (M9,
+unmodified) excludes a frozen or disabled agent from routing
+CANDIDACY — meaning `coordinator.proposeTask()` rejects with
+`ROUTING_FAILED` before `workflow.addTask()` ever creates a task
+record at all (tests 586, 588). This is a STRONGER guarantee than "the
+task is admitted, then fails" — there is no task record, no audit
+entry for a runtime pre-flight check, nothing beyond the routing
+decision itself. A genuine Guardian AUTO-freeze (not a
+directly-imposed one) was proven end to end too (test 589b): three
+real, repeated `HANDLER_ERROR` failures for the same agent, driven
+through the identical propose-run-release-evaluate pattern the
+orchestrator itself uses per stage, trigger `guardian.js`'s own
+unmodified `HANDLER_FAILURE_THRESHOLD` (3, reused directly, never
+redeclared) and impose a real freeze that then blocks a later stage at
+routing — the "repeated handler failures... must stop downstream
+execution" requirement, proven against the real mechanism, not merely
+asserted.
+
+**A mutation-testing gap found and fixed the same way M21's registry-
+immutability gap was: investigated, not dismissed.** The first version
+of test 585 (publishing-package-agent must refuse to run when quality
+control did not pass) used fake, non-existent artifact ids in its
+fixture. Disabling the `qc_passed !== true` guard entirely still left
+the task failing — for a completely different reason
+(`PARENT_NOT_FOUND`, since the fake parent ids the fixture referenced
+do not exist), masking the actual check under test. Fixed by rebuilding
+the fixture from a REAL, complete successful factory run's real
+`stages` object: with the guard removed, this exact input would
+otherwise succeed and create a genuine `CONTENT_PACKAGE` (every
+referenced parent genuinely exists), so the test now actually exercises
+the gate. Re-run: caught. All four of this milestone's own mutations
+(the quality-control agent's presence/type/script-length checks, plus
+this gate) are caught; the ten mutations from M21 and the three from
+M22 were not re-run here since neither `invoke.js`, `artifact-bridge.js`,
+`registry.js`, nor `runtime.js` was touched by this milestone.
+
+**Quality control is deterministic structural validation, stated as
+such everywhere it appears.** `runQualityControlChecks()` (a pure
+function, no store, no clock, no randomness — directly unit-testable,
+tests 581-584) checks presence, artifact type, and script/hook length
+bounds against a SUMMARY the orchestrator assembles from real,
+already-created artifact records — never semantic evaluation of
+content quality, and the report artifact it produces carries an
+explicit `check_type: 'DETERMINISTIC_STRUCTURAL_CHECK'` field (test
+579) so nothing downstream, and no future reader, could mistake it for
+an AI judgment.
+
+**`CONTENT_PACKAGE` references, never copies.** `publishing-package-agent`
+builds its artifact's `content` from small, package-native fields
+(title/description/hashtags/thumbnail_concept/publishing_metadata,
+each a simple, honestly-synthetic derivation from the topic string) plus
+a `references` object of artifact ids — `parent_artifact_ids` on the
+created artifact independently carries the same ids, so the real
+lineage graph (not just a content field a handler could have gotten
+wrong) ties the package to everything it represents (test 574). No
+upstream artifact's actual content is duplicated into the package.
+
+**CEO-preparation, structurally incapable of becoming a CEO.**
+`inspectWorkflowState`, `listFailures`, `listCompletedArtifacts`, and
+`listAvailableSpecialists` are read-only wrappers over existing
+store/workflow/artifact-store read methods — none of them capable of
+approving anything, lifting a freeze, altering an immutable version, or
+granting clearance, because none of them reference anything that could
+(test 593, a structural grep sweep of the same forbidden-term list
+M20-M22 already established, extended to this milestone's new files).
+No CEO agent exists.
+
+**What this milestone deliberately does not do.** No real network
+provider (unchanged from D38/D39). No relaxation of MAX_DEPTH,
+MAX_FANOUT, or MAX_TOTAL_NODES. No change to `workflow.js`,
+`router.js`, `execution-coordinator.js`, `broker.js`, `guardian.js`, or
+`approval-engine.js`. No second artifact-lineage or approval mechanism.
+No CEO agent. No persistence redesign — the full Content Factory
+execution path runs only against the synchronous in-memory store,
+exactly like every prior milestone's live execution path (D28); the
+one Postgres-relevant change (`CONTENT_PACKAGE` in the `artifact_type`
+CHECK constraint) is proven directly against a real database (test
+614) the same way migration 0005 already was. No new dependency,
+credential, network primitive, paid API call, or quota-bypass mechanism
+of any kind.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

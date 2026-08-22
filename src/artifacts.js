@@ -51,6 +51,11 @@ export const ARTIFACT_TYPE = Object.freeze({
   SUBTITLE: 'SUBTITLE',
   EDIT_INSTRUCTION: 'EDIT_INSTRUCTION',
   SOCIAL_PACKAGE: 'SOCIAL_PACKAGE',
+  // Added Milestone 23: a final, governed package that REFERENCES other
+  // immutable artifacts (via parent_artifact_ids) rather than copying
+  // their content — see src/content-factory-agents.js's
+  // publishing-package-agent and DECISIONS.md D40.
+  CONTENT_PACKAGE: 'CONTENT_PACKAGE',
 });
 
 const KNOWN_ARTIFACT_TYPES = Object.freeze(new Set(Object.values(ARTIFACT_TYPE)));

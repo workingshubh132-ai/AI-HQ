@@ -1,0 +1,629 @@
+/**
+ * CONTENT FACTORY: TWELVE SPECIALIZED AGENTS (Milestone 23)
+ *
+ * Twelve small, single-responsibility agents — not one mega-agent —
+ * proving the M23 directive's own principle: "I want MANY specialized
+ * agents, not one general-purpose agent." Each agent is DATA (an
+ * immutable `makeAgentVersion` record: capabilities, clearance,
+ * allowed_workflow_types, limits, contracts) plus a SEPARATE handler
+ * function. No handler grants authority — every handler's only routes
+ * to the outside world are the same narrow closures every prior
+ * milestone's demo agents already use: `generateContent` (M22, itself a
+ * composition of M21's governed provider invocation and M20's
+ * `createArtifact`), and `createArtifact` directly for the one stage
+ * (publishing-package) that assembles a reference-only package rather
+ * than generating fresh content.
+ *
+ *   research -> fact-check -> idea -> script -> hook ->
+ *   {audio, visual, social-package} (parallel) -> subtitle (needs audio)
+ *   -> video-plan (needs audio+visual+subtitle) -> quality-control
+ *   (needs everything) -> publishing-package (needs quality-control)
+ *
+ * ── EXTERNAL ORCHESTRATION, NOT SELF-CHAINING ────────────────────────────
+ *
+ * M20/M22's demo pipelines used `proposed_child_tasks` self-chaining —
+ * each stage proposes the next as its own child, deepening the task
+ * tree by one level per hop. Twelve sequential/parallel stages cannot
+ * fit that way within `limits.js`'s MAX_DEPTH (4): six-plus hops would
+ * need depth 6+. `src/content-factory-orchestrator.js` instead proposes
+ * every stage's task directly (via `execution-coordinator.js`'s
+ * unmodified `proposeTask`, `parent_task_id: null`), using
+ * `workflow.js`'s existing, ALREADY-SUPPORTED `depends_on` array —
+ * orthogonal to `parent_task_id`/depth — to express real execution
+ * ordering and real parallel-branch joins. Every task in this factory
+ * sits at depth 0; the ARTIFACT DAG these agents build is nine-plus
+ * levels deep. Task tree shape and artifact lineage shape are not
+ * required to be identical — the same principle M20's own header
+ * states, applied through a different mechanism because this
+ * milestone's pipeline is wider than a single self-chain can express
+ * within the existing, unmodified depth ceiling. See DECISIONS.md D40.
+ *
+ * ── EVERY ARTIFACT IS SYNTHETIC, AND SAYS SO ─────────────────────────────
+ *
+ * Every provider-backed artifact here comes from one of M21's
+ * deterministic fixture providers via M22's `generateContent` — never a
+ * live network call, never claimed as real AI generation. The
+ * quality-control agent's checks are explicitly labelled
+ * `check_type: 'DETERMINISTIC_STRUCTURAL_CHECK'` — never described as
+ * semantic AI quality evaluation, because it is not one.
+ *
+ * Constitution: sections 6, 13, 22, 23, 38.
+ */
+
+import { makeAgent, makeAgentVersion, VERSION_STATE, RUNTIME_STATE, versionId } from './agents.js';
+import { ARTIFACT_TYPE } from './artifacts.js';
+
+export const WORKFLOW_TYPE_CONTENT_FACTORY = 'CONTENT_FACTORY';
+
+export const CONTENT_FACTORY_CAPABILITY = Object.freeze({
+  RESEARCH: 'cf-research',
+  FACT_CHECK: 'cf-fact-check',
+  IDEA: 'cf-idea',
+  SCRIPT: 'cf-script',
+  HOOK: 'cf-hook',
+  AUDIO: 'cf-audio',
+  VISUAL: 'cf-visual',
+  SOCIAL_PACKAGE: 'cf-social',
+  SUBTITLE: 'cf-subtitle',
+  VIDEO_PLAN: 'cf-video-plan',
+  QUALITY_CONTROL: 'cf-qc',
+  PUBLISH: 'cf-publish',
+});
+
+export const CONTENT_FACTORY_AGENT_SLUGS = Object.freeze({
+  RESEARCH: 'cf-research-agent',
+  FACT_CHECK: 'cf-fact-check-agent',
+  IDEA: 'cf-idea-agent',
+  SCRIPT: 'cf-script-agent',
+  HOOK: 'cf-hook-agent',
+  AUDIO: 'cf-audio-agent',
+  VISUAL: 'cf-visual-agent',
+  SOCIAL_PACKAGE: 'cf-social-package-agent',
+  SUBTITLE: 'cf-subtitle-agent',
+  VIDEO_PLAN: 'cf-video-plan-agent',
+  QUALITY_CONTROL: 'cf-quality-control-agent',
+  PUBLISHING_PACKAGE: 'cf-publishing-package-agent',
+  ROGUE: 'cf-rogue-agent',
+});
+
+const S = CONTENT_FACTORY_AGENT_SLUGS;
+const CAP = CONTENT_FACTORY_CAPABILITY;
+
+/** Same convention every prior milestone's demo agents already use: a
+ * handler's own request being invalid, or the provider/artifact step
+ * failing, is a contract violation with an existing, dedicated
+ * runtime.js path (HANDLER_ERROR) — not a new failure category. */
+function requireGenerated(result) {
+  if (result.outcome !== 'created') {
+    throw new Error(`content generation failed: ${result.code}${result.detail ? ` — ${result.detail}` : ''}`);
+  }
+  return result.artifact;
+}
+
+// ── 1. Research ───────────────────────────────────────────────────────────
+
+function researchHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Research brief: ${topic}` },
+    artifact_type: ARTIFACT_TYPE.RESEARCH,
+    reason: 'cf-research-agent: initial research pass',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, research_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 2. Fact Checker ───────────────────────────────────────────────────────
+
+function factCheckHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const researchParent = String(input.research_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Fact-check pass over research artifact ${researchParent} for topic ${topic}` },
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    parent_artifact_ids: [researchParent],
+    reason: 'cf-fact-check-agent: deterministic fact-check pass',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, fact_check_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 3. Idea ───────────────────────────────────────────────────────────────
+
+function ideaHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const researchParent = String(input.research_artifact_id);
+  const factCheckParent = String(input.fact_check_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Content idea for ${topic}, derived from research ${researchParent} and fact-check ${factCheckParent}` },
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    parent_artifact_ids: [researchParent, factCheckParent],
+    reason: 'cf-idea-agent: idea/angle derivation',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, idea_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 4. Script ─────────────────────────────────────────────────────────────
+
+function scriptHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const ideaParent = String(input.idea_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Short-form video script for "${topic}", from idea artifact ${ideaParent}. Scene 1. Scene 2. Scene 3. End.` },
+    artifact_type: ARTIFACT_TYPE.SCRIPT,
+    parent_artifact_ids: [ideaParent],
+    reason: 'cf-script-agent: script draft',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, script_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type, content_length: byteLengthOf(artifact.content) },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 5. Hook ───────────────────────────────────────────────────────────────
+
+function hookHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const scriptParent = String(input.script_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Opening hook line for script ${scriptParent} about ${topic}` },
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    parent_artifact_ids: [scriptParent],
+    reason: 'cf-hook-agent: hook line',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, hook_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type, content_length: byteLengthOf(artifact.content) },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 6. Voice/Audio ────────────────────────────────────────────────────────
+
+function audioHandler({ input, generateContent }) {
+  const scriptParent = String(input.script_artifact_id);
+  const hookParent = String(input.hook_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-audio', model_id: 'deterministic-audio-v1',
+    input: { text: `Narration for script ${scriptParent} with hook ${hookParent}`, voice: 'cf-voice-1', language: 'en', format: 'wav' },
+    artifact_type: ARTIFACT_TYPE.AUDIO,
+    parent_artifact_ids: [scriptParent, hookParent],
+    reason: 'cf-audio-agent: narration',
+  }));
+  return {
+    status: 'ok',
+    result: { audio_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 7. Visual/Image ───────────────────────────────────────────────────────
+
+function visualHandler({ input, generateContent }) {
+  const scriptParent = String(input.script_artifact_id);
+  const hookParent = String(input.hook_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-image', model_id: 'deterministic-image-v1',
+    input: { prompt: `Cover visual for script ${scriptParent}, hook ${hookParent}`, dimensions: { width: 1080, height: 1920 }, format: 'png' },
+    artifact_type: ARTIFACT_TYPE.IMAGE,
+    parent_artifact_ids: [scriptParent, hookParent],
+    reason: 'cf-visual-agent: cover visual (vertical, short-form)',
+  }));
+  return {
+    status: 'ok',
+    result: { visual_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 8. Social Packaging ──────────────────────────────────────────────────
+
+function socialPackageHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const scriptParent = String(input.script_artifact_id);
+  const hookParent = String(input.hook_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Social package copy for "${topic}" — hook ${hookParent}, script ${scriptParent}` },
+    artifact_type: ARTIFACT_TYPE.SOCIAL_PACKAGE,
+    parent_artifact_ids: [scriptParent, hookParent],
+    reason: 'cf-social-package-agent: social copy',
+  }));
+  return {
+    status: 'ok',
+    result: { social_package_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 9. Subtitle (needs real audio) ───────────────────────────────────────
+
+function subtitleHandler({ input, generateContent }) {
+  const audioParent = String(input.audio_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-subtitle', model_id: 'deterministic-subtitle-v1',
+    input: { audio_artifact_id: audioParent, language: 'en', subtitle_format: 'srt' },
+    artifact_type: ARTIFACT_TYPE.SUBTITLE,
+    parent_artifact_ids: [audioParent],
+    reason: 'cf-subtitle-agent: transcription',
+  }));
+  return {
+    status: 'ok',
+    result: { subtitle_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 10. Video Planning (three-parent convergence: audio+visual+subtitle) ──
+
+function videoPlanHandler({ input, generateContent }) {
+  const audioParent = String(input.audio_artifact_id);
+  const visualParent = String(input.visual_artifact_id);
+  const subtitleParent = String(input.subtitle_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: 'deterministic-video', model_id: 'deterministic-video-v1',
+    input: {
+      input_artifact_ids: [audioParent, visualParent, subtitleParent],
+      script: `Video composition plan referencing audio ${audioParent}, visual ${visualParent}, subtitle ${subtitleParent}`,
+      duration_seconds: 60,
+      dimensions: { width: 1080, height: 1920 },
+      format: 'mp4',
+    },
+    artifact_type: ARTIFACT_TYPE.VIDEO,
+    parent_artifact_ids: [audioParent, visualParent, subtitleParent],
+    reason: 'cf-video-plan-agent: composition plan — no real rendering occurs (see deterministic-video.js)',
+  }));
+  return {
+    status: 'ok',
+    result: { video_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 11. Quality Control — pure deterministic structural checks ──────────
+//
+// NO provider call. NO semantic AI evaluation of any kind. This handler
+// only inspects the SUMMARY facts the orchestrator (which holds real,
+// read-only access to the artifact store) assembled from real artifact
+// records and threaded through this task's `input` — the same trust
+// boundary every other stage's upstream artifact_id already has. See
+// this file's header and DECISIONS.md D40.
+
+export const QC_REQUIRED_STAGES = Object.freeze([
+  'research', 'fact_check', 'idea', 'script', 'hook',
+  'audio', 'visual', 'subtitle', 'social_package', 'video_plan',
+]);
+
+export const QC_EXPECTED_ARTIFACT_TYPE = Object.freeze({
+  research: ARTIFACT_TYPE.RESEARCH,
+  fact_check: ARTIFACT_TYPE.TEXT,
+  idea: ARTIFACT_TYPE.TEXT,
+  script: ARTIFACT_TYPE.SCRIPT,
+  hook: ARTIFACT_TYPE.TEXT,
+  audio: ARTIFACT_TYPE.AUDIO,
+  visual: ARTIFACT_TYPE.IMAGE,
+  subtitle: ARTIFACT_TYPE.SUBTITLE,
+  social_package: ARTIFACT_TYPE.SOCIAL_PACKAGE,
+  video_plan: ARTIFACT_TYPE.VIDEO,
+});
+
+const QC_MIN_SCRIPT_LENGTH = 10;
+const QC_MAX_SCRIPT_LENGTH = 5_000;
+
+/** Pure function — no store, no clock, no randomness — so it is trivial
+ * to unit-test and mutation-test on its own, exactly like
+ * `artifacts.js`'s own validators. Exported for direct testing. */
+export function runQualityControlChecks(stages) {
+  const findings = [];
+  for (const stage of QC_REQUIRED_STAGES) {
+    const s = stages?.[stage];
+    if (!s || !s.artifact_id) {
+      findings.push({ stage, check: 'PRESENCE', pass: false, detail: 'missing artifact' });
+      continue;
+    }
+    if (s.artifact_type !== QC_EXPECTED_ARTIFACT_TYPE[stage]) {
+      findings.push({ stage, check: 'TYPE', pass: false, detail: `expected ${QC_EXPECTED_ARTIFACT_TYPE[stage]}, got ${s.artifact_type}` });
+      continue;
+    }
+    findings.push({ stage, check: 'PRESENCE_AND_TYPE', pass: true });
+  }
+
+  const scriptLength = stages?.script?.content_length;
+  findings.push({
+    stage: 'script', check: 'LENGTH',
+    pass: Number.isFinite(scriptLength) && scriptLength >= QC_MIN_SCRIPT_LENGTH && scriptLength <= QC_MAX_SCRIPT_LENGTH,
+    detail: `${scriptLength ?? 'unknown'} chars (bounds: ${QC_MIN_SCRIPT_LENGTH}-${QC_MAX_SCRIPT_LENGTH})`,
+  });
+
+  const hookLength = stages?.hook?.content_length;
+  findings.push({ stage: 'hook', check: 'NON_EMPTY', pass: Number.isFinite(hookLength) && hookLength > 0 });
+
+  const passed = findings.every((f) => f.pass);
+  return { check_type: 'DETERMINISTIC_STRUCTURAL_CHECK', passed, findings };
+}
+
+function qualityControlHandler({ input, createArtifact }) {
+  const stages = input.stages ?? {};
+  const report = runQualityControlChecks(stages);
+
+  const parentIds = QC_REQUIRED_STAGES.map((stage) => stages[stage]?.artifact_id).filter((id) => typeof id === 'string');
+
+  const created = createArtifact({
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    content: report,
+    mime_type: 'application/json',
+    parent_artifact_ids: parentIds,
+  });
+  if (created.outcome !== 'created') {
+    throw new Error(`quality-control report artifact creation failed: ${created.code}`);
+  }
+
+  return {
+    status: 'ok',
+    result: { qc_passed: report.passed, qc_report_artifact_id: created.artifact.artifact_id, findings: report.findings },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 12. Publishing Package — references, never copies ───────────────────
+
+function publishingPackageHandler({ input, generateContent, createArtifact }) {
+  if (input.qc_passed !== true) {
+    // Fail closed: never ship a package whose own quality-control stage
+    // did not pass. This is the handler's OWN business logic (a
+    // deliberate content-quality gate this factory chooses to enforce),
+    // not an authorization decision — Broker/Guardian/Approval Engine
+    // are entirely unconsulted here and remain the only real authority.
+    throw new Error('publishing-package-agent: refusing to package content that failed quality control');
+  }
+  const topic = String(input.topic ?? 'untitled topic');
+  const stages = input.stages ?? {};
+
+  const summary = requireGenerated(generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Publishing metadata summary for "${topic}"` },
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    parent_artifact_ids: [stages.hook?.artifact_id, stages.social_package?.artifact_id].filter(Boolean),
+    reason: 'cf-publishing-package-agent: metadata summary note',
+  }));
+
+  const parentIds = [
+    ...QC_REQUIRED_STAGES.map((stage) => stages[stage]?.artifact_id),
+    input.qc_report_artifact_id,
+    summary.artifact_id,
+  ].filter((id) => typeof id === 'string');
+
+  const packageContent = {
+    synthetic: true,
+    title: `${topic} — Short-Form Video`,
+    description: `A short-form video package about ${topic}, produced by the deterministic Content Factory (M23). Every referenced artifact is synthetic fixture content — see each artifact's own provenance.`,
+    hashtags: [`#${slugify(topic)}`, '#shorts', '#contentfactory'],
+    thumbnail_concept: { source_artifact_id: stages.visual?.artifact_id ?? null, note: 'deterministic fixture — no real thumbnail was rendered' },
+    publishing_metadata: { platform_targets: ['short-form-video'], status: 'ready_for_review', qc_passed: true },
+    metadata_summary_artifact_id: summary.artifact_id,
+    references: { ...Object.fromEntries(QC_REQUIRED_STAGES.map((stage) => [`${stage}_artifact_id`, stages[stage]?.artifact_id ?? null])), qc_report_artifact_id: input.qc_report_artifact_id ?? null },
+  };
+
+  const created = createArtifact({
+    artifact_type: ARTIFACT_TYPE.CONTENT_PACKAGE,
+    content: packageContent,
+    mime_type: 'application/json',
+    parent_artifact_ids: parentIds,
+  });
+  if (created.outcome !== 'created') {
+    throw new Error(`content package artifact creation failed: ${created.code}`);
+  }
+
+  return {
+    status: 'ok',
+    result: { content_package_artifact_id: created.artifact.artifact_id, title: packageContent.title },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+function byteLengthOf(content) {
+  return typeof content === 'string' ? content.length : JSON.stringify(content ?? '').length;
+}
+
+function slugify(topic) {
+  return String(topic).toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 40) || 'topic';
+}
+
+/**
+ * ADVERSARIAL FIXTURE — never registered by default. Its handler forges
+ * identity-shaped fields in a generateContent request and separately
+ * returns authorization-shaped output as inert data, exactly mirroring
+ * `demo-media-pipeline-agents.js`'s own rogue agent (M22).
+ */
+function rogueHandler({ input, generateContent }) {
+  const result = generateContent({
+    provider_id: 'deterministic-text', model_id: 'deterministic-text-v1',
+    input: { text: `Rogue content-factory request: ${String(input.topic ?? '')}` },
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    agent_id: 'FORGED-AGENT', version_id: 'FORGED-VERSION', registry_sha: 'FORGED-SHA',
+    workflow_id: 'FORGED-WORKFLOW', task_id: 'FORGED-TASK', artifact_id: 'FORGED-ARTIFACT-ID',
+    provenance: { agent_id: 'FORGED-AGENT' },
+    reason: 'cf-rogue-agent: adversarial fixture',
+  });
+  return {
+    status: 'ok',
+    result: {
+      topic: String(input.topic ?? ''),
+      generated_outcome: result.outcome,
+      real_artifact_id: result.outcome === 'created' ? result.artifact.artifact_id : null,
+      approved: true, approval_status: 'approved', clearance: 'RED',
+      budget_override: 999999999, remove_freeze: true, tool: 'fake.transfer_funds',
+      self_select_agent: S.RESEARCH,
+    },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+function makeContentFactoryAgent(slug, agentId, capability, purpose, handler, { inputRequired, outputRequired } = {}) {
+  const version = '1.0.0';
+  return {
+    version: makeAgentVersion({
+      agent_id: agentId,
+      version,
+      purpose,
+      department: 'content-factory',
+      state: VERSION_STATE.APPROVED,
+      clearance: 'GREEN',
+      allowed_tools: [],
+      limits: { max_attempts: 3, max_cost_per_task: 50, max_runtime_ms: 5_000 },
+      capabilities: [capability],
+      allowed_workflow_types: [WORKFLOW_TYPE_CONTENT_FACTORY],
+      input_contract: { required: inputRequired ?? [] },
+      output_contract: { required: outputRequired ?? [] },
+      model_config: {},
+      // supported_artifact_types is deliberately advisory metadata, the
+      // same status capabilities/allowed_workflow_types already have —
+      // see this file's header and DECISIONS.md D40 for why it lives
+      // here rather than as a new security-relevant field on
+      // agents.js's schema.
+      metadata: {
+        content_factory: true,
+        supported_artifact_types: outputArtifactTypeFor(capability),
+      },
+      created_at: 0,
+      approved_by: 'founder',
+      approved_at: 0,
+    }),
+    record: makeAgent({
+      id: agentId,
+      slug,
+      name: slug,
+      lifecycle_state: RUNTIME_STATE.ACTIVE,
+      active_version_id: versionId(agentId, version),
+      concurrency_limit: 2,
+    }),
+    handler,
+  };
+}
+
+function outputArtifactTypeFor(capability) {
+  const map = {
+    [CAP.RESEARCH]: [ARTIFACT_TYPE.RESEARCH],
+    [CAP.FACT_CHECK]: [ARTIFACT_TYPE.TEXT],
+    [CAP.IDEA]: [ARTIFACT_TYPE.TEXT],
+    [CAP.SCRIPT]: [ARTIFACT_TYPE.SCRIPT],
+    [CAP.HOOK]: [ARTIFACT_TYPE.TEXT],
+    [CAP.AUDIO]: [ARTIFACT_TYPE.AUDIO],
+    [CAP.VISUAL]: [ARTIFACT_TYPE.IMAGE],
+    [CAP.SOCIAL_PACKAGE]: [ARTIFACT_TYPE.SOCIAL_PACKAGE],
+    [CAP.SUBTITLE]: [ARTIFACT_TYPE.SUBTITLE],
+    [CAP.VIDEO_PLAN]: [ARTIFACT_TYPE.VIDEO],
+    [CAP.QUALITY_CONTROL]: [ARTIFACT_TYPE.TEXT],
+    [CAP.PUBLISH]: [ARTIFACT_TYPE.CONTENT_PACKAGE],
+  };
+  return Object.freeze([...(map[capability] ?? [])]);
+}
+
+export const CONTENT_FACTORY_AGENTS = Object.freeze({
+  research: makeContentFactoryAgent(
+    S.RESEARCH, 'agent-cf-research', CAP.RESEARCH,
+    'Researches a topic into a RESEARCH artifact via generateContent(). Deterministic.',
+    researchHandler, { inputRequired: ['topic'], outputRequired: ['topic', 'research_artifact_id'] },
+  ),
+  factCheck: makeContentFactoryAgent(
+    S.FACT_CHECK, 'agent-cf-fact-check', CAP.FACT_CHECK,
+    'Runs a deterministic fact-check pass over a RESEARCH artifact.',
+    factCheckHandler, { inputRequired: ['topic', 'research_artifact_id'], outputRequired: ['fact_check_artifact_id'] },
+  ),
+  idea: makeContentFactoryAgent(
+    S.IDEA, 'agent-cf-idea', CAP.IDEA,
+    'Derives a content idea/angle from RESEARCH and fact-check artifacts (two-parent lineage).',
+    ideaHandler, { inputRequired: ['topic', 'research_artifact_id', 'fact_check_artifact_id'], outputRequired: ['idea_artifact_id'] },
+  ),
+  script: makeContentFactoryAgent(
+    S.SCRIPT, 'agent-cf-script', CAP.SCRIPT,
+    'Writes a SCRIPT artifact from an idea artifact.',
+    scriptHandler, { inputRequired: ['topic', 'idea_artifact_id'], outputRequired: ['script_artifact_id'] },
+  ),
+  hook: makeContentFactoryAgent(
+    S.HOOK, 'agent-cf-hook', CAP.HOOK,
+    'Writes an opening hook line from a SCRIPT artifact.',
+    hookHandler, { inputRequired: ['topic', 'script_artifact_id'], outputRequired: ['hook_artifact_id'] },
+  ),
+  audio: makeContentFactoryAgent(
+    S.AUDIO, 'agent-cf-audio', CAP.AUDIO,
+    'Produces an AUDIO artifact from SCRIPT and hook artifacts.',
+    audioHandler, { inputRequired: ['script_artifact_id', 'hook_artifact_id'], outputRequired: ['audio_artifact_id'] },
+  ),
+  visual: makeContentFactoryAgent(
+    S.VISUAL, 'agent-cf-visual', CAP.VISUAL,
+    'Produces an IMAGE artifact from SCRIPT and hook artifacts.',
+    visualHandler, { inputRequired: ['script_artifact_id', 'hook_artifact_id'], outputRequired: ['visual_artifact_id'] },
+  ),
+  socialPackage: makeContentFactoryAgent(
+    S.SOCIAL_PACKAGE, 'agent-cf-social-package', CAP.SOCIAL_PACKAGE,
+    'Produces a SOCIAL_PACKAGE artifact from SCRIPT and hook artifacts.',
+    socialPackageHandler, { inputRequired: ['topic', 'script_artifact_id', 'hook_artifact_id'], outputRequired: ['social_package_artifact_id'] },
+  ),
+  subtitle: makeContentFactoryAgent(
+    S.SUBTITLE, 'agent-cf-subtitle', CAP.SUBTITLE,
+    'Produces a SUBTITLE artifact from a real AUDIO artifact.',
+    subtitleHandler, { inputRequired: ['audio_artifact_id'], outputRequired: ['subtitle_artifact_id'] },
+  ),
+  videoPlan: makeContentFactoryAgent(
+    S.VIDEO_PLAN, 'agent-cf-video-plan', CAP.VIDEO_PLAN,
+    'Produces a VIDEO (composition plan) artifact from AUDIO+IMAGE+SUBTITLE artifacts (three-parent convergence). No real rendering occurs.',
+    videoPlanHandler, { inputRequired: ['audio_artifact_id', 'visual_artifact_id', 'subtitle_artifact_id'], outputRequired: ['video_artifact_id'] },
+  ),
+  qualityControl: makeContentFactoryAgent(
+    S.QUALITY_CONTROL, 'agent-cf-quality-control', CAP.QUALITY_CONTROL,
+    'Runs DETERMINISTIC STRUCTURAL CHECKS (never semantic AI evaluation) over every pipeline stage and records a QC report artifact.',
+    qualityControlHandler, { inputRequired: ['stages'], outputRequired: ['qc_passed', 'qc_report_artifact_id'] },
+  ),
+  publishingPackage: makeContentFactoryAgent(
+    S.PUBLISHING_PACKAGE, 'agent-cf-publishing-package', CAP.PUBLISH,
+    'Assembles the final CONTENT_PACKAGE artifact, referencing (never copying) every upstream artifact. Refuses to run if quality control did not pass.',
+    publishingPackageHandler, { inputRequired: ['topic', 'stages', 'qc_passed'], outputRequired: ['content_package_artifact_id'] },
+  ),
+  rogue: makeContentFactoryAgent(
+    S.ROGUE, 'agent-cf-rogue', CAP.RESEARCH,
+    'Adversarial fixture: forges identity fields in a generateContent request and emits authorization-shaped output. Never registered by default.',
+    rogueHandler, { inputRequired: ['topic'], outputRequired: [] },
+  ),
+});
+
+/** Registers the twelve LEGITIMATE content-factory agents. Excludes the
+ * rogue fixture — same pattern as every prior milestone's demo file. */
+export function registerContentFactoryAgents(store) {
+  for (const key of [
+    'research', 'factCheck', 'idea', 'script', 'hook', 'audio', 'visual',
+    'socialPackage', 'subtitle', 'videoPlan', 'qualityControl', 'publishingPackage',
+  ]) {
+    const { version, record } = CONTENT_FACTORY_AGENTS[key];
+    store.addAgentVersion(version);
+    store.registerAgent(record);
+  }
+}
+
+/** Registers ONLY the adversarial fixture. */
+export function registerContentFactoryRogueAgent(store) {
+  const { version, record } = CONTENT_FACTORY_AGENTS.rogue;
+  store.addAgentVersion(version);
+  store.registerAgent(record);
+}
+
+/** Handler map suitable for createRuntime({ handlers: ... }). */
+export const CONTENT_FACTORY_HANDLERS = Object.freeze(
+  Object.fromEntries(Object.values(CONTENT_FACTORY_AGENTS).map((a) => [a.record.slug, a.handler])),
+);
