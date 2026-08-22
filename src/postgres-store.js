@@ -109,19 +109,33 @@ function rowToApproval(row) {
   if (!row) return null;
   return {
     id: row.id,
+    // M18 (approval-engine.js): the application-assigned identity a
+    // decision/revocation's own approval_reference points back to —
+    // distinct from this row's DB-generated `id` above, same relationship
+    // tasks.id already has to nothing. Null for every pre-M18 record.
+    approval_id: row.approval_id,
     task_id: row.task_id,
     agent_id: row.agent_id,
+    version_id: row.version_id,
+    registry_sha: row.registry_sha,
     action_type: row.action_type,
     tool_id: row.tool_id,
     agent_intent: row.agent_intent,
     payload: row.payload,
     payload_hash: row.payload_hash,
     status: row.status,
+    reason: row.reason,
+    approval_reference: row.approval_reference,
     approved_payload: row.approved_payload,
     approved_payload_hash: row.approved_payload_hash,
     rendered_description: row.rendered_description,
     decided_by: row.decided_by,
     decided_at: num(row.decided_at),
+    // requested_at is approval-engine.js's own field name for "when this
+    // record was created" — the same concept created_at already tracks
+    // for every other table; aliased here rather than adding a redundant
+    // column. Both names read the same underlying value.
+    requested_at: num(row.created_at),
     expires_at: num(row.expires_at),
     created_at: num(row.created_at),
   };
@@ -345,16 +359,18 @@ export function createPostgresStore(pool) {
     async addApproval(approval) {
       await pool.query(
         `insert into public.approvals
-           (task_id, agent_id, action_type, tool_id, agent_intent, payload, payload_hash, status,
-            approved_payload, approved_payload_hash, rendered_description, decided_by, decided_at,
-            expires_at, created_at)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+           (approval_id, task_id, agent_id, version_id, registry_sha, action_type, tool_id, agent_intent,
+            payload, payload_hash, status, reason, approval_reference, approved_payload,
+            approved_payload_hash, rendered_description, decided_by, decided_at, expires_at, created_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
         [
-          approval.task_id, approval.agent_id ?? null, approval.action_type, approval.tool_id ?? null,
+          approval.approval_id ?? null, approval.task_id, approval.agent_id ?? null, approval.version_id ?? null,
+          approval.registry_sha ?? null, approval.action_type, approval.tool_id ?? null,
           approval.agent_intent ?? null, JSON.stringify(approval.payload ?? {}), approval.payload_hash,
-          approval.status, approval.approved_payload ? JSON.stringify(approval.approved_payload) : null,
+          approval.status, approval.reason ?? null, approval.approval_reference ?? null,
+          approval.approved_payload ? JSON.stringify(approval.approved_payload) : null,
           approval.approved_payload_hash ?? null, approval.rendered_description, approval.decided_by ?? null,
-          approval.decided_at ?? null, approval.expires_at ?? null, approval.created_at ?? 0,
+          approval.decided_at ?? null, approval.expires_at ?? null, approval.requested_at ?? approval.created_at ?? 0,
         ],
       );
     },

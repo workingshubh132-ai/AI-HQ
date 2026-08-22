@@ -1548,6 +1548,149 @@ actor-identity system beyond a required plain string.
 
 ---
 
+## D35 — Policy / approval engine: a new file, three small load-bearing edits, and no second Broker
+
+Decided 2026-08-22 (Milestone 18).
+
+`src/approval-engine.js` has exactly two responsibilities: POLICY
+(`decidePolicy` reuses `actions.js`'s existing TIER table verbatim — no
+new tier system, no AI policy judge) and APPROVAL LIFECYCLE
+(`requestApproval`/`decide`/`revoke`, each producing an immutable,
+append-only record). It has no authorization logic of its own — no
+handler, model, or agent output ever holds a reference to it (runtime.js's
+fixed handler signature, unchanged since M14, structurally prevents this)
+— and payload-hash/description binding is reused directly from
+M4.5/M4.6's `hashPayload`/`renderPayload`, not reimplemented.
+
+**The Broker needed a small, additive extension — the one deviation from
+"do not touch the frozen security files."** `resolvePerItemApproval` had
+no concept of revocation, and no binding to the requesting agent, its
+version, or the running registry SHA. An approval could be silently
+reused by a different agent, an upgraded version, or a different build,
+and once granted it could never be withdrawn. Fixing this outside
+broker.js (a wrapper the Broker doesn't know about) cannot be fail-closed
+— any caller could still reach `broker.execute()` directly and bypass the
+wrapper entirely. So the fix is inside `resolvePerItemApproval` itself:
+`agent`/`registrySha` are new, optional parameters; `isBound()` gates
+every new check so it only fires when the approval record itself declares
+the field — no pre-M18 fixture ever does, so every existing caller and
+test is provably unaffected (391 offline tests before this file existed,
+confirmed unchanged after the broker.js edit alone). Revocation is
+resolved the same way approval itself already was: a later record with
+`status: 'revoked'` and `approval_reference` pointing at the granted
+approval's own `approval_id` supersedes it — one more append-only
+record, not a mutation.
+
+**One-time approval consumption was deliberately not implemented.** The
+existing `idempotency_key` mechanism (M11, concurrency-proven) already
+guarantees a given execution happens exactly once; a *second*,
+approval-level one-time-use lock would either mutate an immutable record
+(breaking the append-only audit design this milestone otherwise commits
+to) or require a second atomic-claim primitive with no concrete evidence
+of need. Documented here rather than silently omitted.
+
+**Two real "append-only, but the check re-reads a field that's never
+mutated" bugs were found and fixed during test development, not by
+inspection.** Because `decide()` and `revoke()` create NEW records
+instead of mutating the original, the original PENDING (or APPROVED)
+record's own `status` field never changes. An early version of `decide()`
+checked `pending.status !== 'pending'` to detect "already decided" —
+always false, since that field is permanently `'pending'` — so a second
+decision on the same approval silently succeeded (caught by test 380: the
+second call returned `'decided'` instead of the expected `'rejected'`).
+`revoke()` had the identical bug shape for double-revocation (test 380b,
+added specifically to cover this). Both are fixed the same way: search
+the store for any OTHER record whose `approval_reference` already points
+at this one, rather than trusting the target's own `status` field.
+
+**An unawaited-Promise bug, the same shape as M17's, was caught before it
+shipped — specifically because a real Postgres test was written.**
+`requestApproval`/`decide`/`revoke` originally called `store.getAgent()`/
+`store.addApproval()`/`store.approvalsForTask()` without `await`. Harmless
+against the synchronous in-memory store; against the real async
+`postgres-store.js`, an unawaited call returns a pending Promise, which is
+always truthy — `if (!agent)` never fires, and every subsequent field
+read comes off the Promise object, not the resolved agent. Fixed by
+making all three functions genuinely `async`, exactly the fix M17's
+`agent-lifecycle.js` made first.
+
+**Writing the Postgres test surfaced schema gaps that could not have been
+found by reasoning alone.** `postgres-store.js`'s `addApproval`/
+`rowToApproval` silently dropped every M18 field (`approval_id`,
+`version_id`, `registry_sha`, `approval_reference`, `reason`) — fixed.
+Migration 0003's `approvals_status_check` rejected `'revoked'` outright,
+and its `approvals_decision_complete_check` accepted only `'pending'` (no
+`decided_by`/`decided_at`) or `'approved'`/`'rejected'` (both required) —
+a `'revoked'` row, which always carries both, satisfied neither branch and
+could never be inserted. Migration 0006 widens both constraints, adding
+no new table and rewriting no existing row. `approvals.task_id` also
+carries a real foreign key to `tasks.id` (`on delete cascade`) that the
+in-memory store does not enforce — every Postgres-backed test creates its
+task row first via a `pgCreateTask()` helper.
+
+**`generateApprovalId()`'s first version could collide across engine
+instances — found by the Postgres tests, not invented as a hypothetical.**
+IDs were `` `approval-${clock()}-${counter}` ``, with `counter` reset to 0
+on every `createApprovalEngine()` call. Two engine instances sharing one
+clock tick (a fixed test clock, or two processes racing the same
+millisecond in production) generate identical IDs — confirmed directly:
+a second Postgres test crashed on `approvals_approval_id_idx`'s unique
+constraint. Fixed by adding `randomUUID()` (`node:crypto` — already a
+project dependency via `payload.js`'s `createHash`, so no new package) to
+the generated ID; the clock prefix stays for log readability, but
+uniqueness no longer depends on it.
+
+**`broker.js` cannot run against a real async store at all — a
+pre-existing D28 boundary, not something M18 introduced, but one M18's
+own Postgres tests hit directly and had to design around rather than
+paper over.** `broker.execute()` calls `store.activeFreeze(...)`,
+`store.getAgent(...)`, and (via `resolvePerItemApproval`)
+`store.approvalsForTask(...)` all unawaited, by design (D28: the live
+synchronous core stays synchronous). Against `postgres-store.js`'s
+genuinely async methods, every one of those calls returns a pending
+Promise — always truthy — which broke freeze resolution outright when
+first tried (`createBroker({ store: pgStore })` denied every request with
+`GLOBAL_FREEZE`, reproduced and confirmed directly). Making broker.js
+async to accommodate this would be exactly the "replace/weaken the
+Broker" this milestone forbids, and far larger than "the smallest
+possible change" it permits. So the Postgres tests for the full
+request→decide (test 391) and revoke (test 393) flows assert directly on
+the fields Postgres returns — the same fields `resolvePerItemApproval`
+reads — rather than routing them through `broker.execute()` with an async
+store. This is a real, existing limitation of the current architecture,
+not new to M18, and is recorded here because M18 is the first milestone
+whose own tests actually exercised it.
+
+**Mutation testing: 14 of 15 targeted checks caught, 1 confirmed
+redundant by design.** Each check was disabled or inverted in place, the
+relevant test file run to confirm specific named test failures, then the
+file restored and diff-checked byte-identical before moving to the next.
+Fourteen mutations (approval requirement, approval-status bypass, expiry,
+revocation, payload binding, description binding, version binding,
+registry-SHA binding, lifecycle-check bypass, freeze-check bypass,
+Broker-side approval-validation bypass, actor-type bypass in `decide()`,
+missing audit event, RED-through-approval) each produced specific,
+expected test failures. The fifteenth — disabling the `action_type`
+filter (`sameAction`) in `resolvePerItemApproval` alone — produced zero
+failures. Investigated rather than dismissed: `renderPayload()`'s
+deterministic output includes a literal `Action: <action_type>` line, so
+any approval whose `action_type` differs also fails the already-load-bearing
+description-binding check. A compound mutation disabling *both* the
+`action_type` filter and description binding together was run to check
+for a residual gap — it produced the identical 5 failures as disabling
+description binding alone, confirming the `action_type` filter is fully
+redundant defense-in-depth for every scenario the current binding covers,
+not an unguarded gap.
+
+**What this milestone deliberately does not do.** No human dashboard, no
+authentication or identity infrastructure (`actor_type: 'human'` plus a
+required non-empty `actor` string is explicitly documented as *not*
+identity verification), no automatic or model-driven approval, no new
+storage method (only new fields on the existing `approvals` shape), no
+new dependency, no network primitive, no credential.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
@@ -1560,10 +1703,9 @@ Not decided yet, and not needed yet. Listed so they are not forgotten.
 | Deployment host | There is something worth hosting |
 | Supabase free-tier inactivity pausing | Connecting Supabase |
 | Soft-freeze thresholds and cooling period | Guardian milestone |
-| Approval queue maximum | Approval mechanism milestone |
+| Approval queue maximum (cap on outstanding pending approvals) | A concrete need for one is observed |
 | Where the freeze record lives (table vs columns) | Guardian milestone |
 | Concrete budget figures | Before the first paid API call |
-| Approval staleness handling | v0.2 |
 
 Empty folders are not created ahead of need. Git cannot store an empty
 folder, and structure with nothing in it is a guess about the future

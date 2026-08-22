@@ -51,6 +51,11 @@ export const REASON = Object.freeze({
   APPROVAL_EXPIRED: 'APPROVAL_EXPIRED',
   APPROVAL_PAYLOAD_MISMATCH: 'APPROVAL_PAYLOAD_MISMATCH',
   APPROVAL_DESCRIPTION_MISMATCH: 'APPROVAL_DESCRIPTION_MISMATCH',
+  // M18 — see resolvePerItemApproval's file comment and DECISIONS.md D35.
+  APPROVAL_REVOKED: 'APPROVAL_REVOKED',
+  APPROVAL_AGENT_MISMATCH: 'APPROVAL_AGENT_MISMATCH',
+  APPROVAL_VERSION_MISMATCH: 'APPROVAL_VERSION_MISMATCH',
+  APPROVAL_REGISTRY_MISMATCH: 'APPROVAL_REGISTRY_MISMATCH',
   INVALID_APPROVAL: 'INVALID_APPROVAL',
   IDEMPOTENCY_KEY_REQUIRED: 'IDEMPOTENCY_KEY_REQUIRED',
   IDEMPOTENCY_IN_FLIGHT: 'IDEMPOTENCY_IN_FLIGHT',
@@ -68,7 +73,11 @@ const AGENT_CLEARANCES = Object.freeze([TIER.GREEN, TIER.YELLOW]);
 const AGENT_STATES = Object.freeze([
   'draft', 'testing', 'active', 'degraded', 'paused', 'disabled', 'frozen', 'retired',
 ]);
-const APPROVAL_STATUSES = Object.freeze(['pending', 'approved', 'rejected']);
+// M18: 'revoked' added — src/approval-engine.js creates a revocation as a
+// NEW record (never mutates the original 'approved' one; see that file's
+// header and DECISIONS.md D35), so the Broker must recognise the status
+// string rather than reject it as unrecognised.
+const APPROVAL_STATUSES = Object.freeze(['pending', 'approved', 'rejected', 'revoked']);
 
 /** Fails closed: anything not provably well-formed is rejected. */
 function validateAgent(agent) {
@@ -89,9 +98,15 @@ function validateApproval(approval) {
   if (!APPROVAL_STATUSES.includes(approval.status)) return 'unrecognised status';
   if (typeof approval.action_type !== 'string') return 'missing action_type';
   if (!approval.payload || typeof approval.payload !== 'object') return 'missing payload';
+  // M18: a revocation record is also a human decision — it must name who
+  // and when, exactly like an approval, even though it carries no payload
+  // hash/description binding of its own (it is not authorizing bytes; it
+  // is withdrawing a prior authorization).
+  if (approval.status === 'approved' || approval.status === 'revoked') {
+    if (typeof approval.decided_by !== 'string' || approval.decided_by === '') return `${approval.status} without decided_by`;
+    if (!Number.isFinite(approval.decided_at)) return `${approval.status} without decided_at`;
+  }
   if (approval.status === 'approved') {
-    if (typeof approval.decided_by !== 'string' || approval.decided_by === '') return 'approved without decided_by';
-    if (!Number.isFinite(approval.decided_at)) return 'approved without decided_at';
     // Fail closed: an approval that does not record WHICH BYTES were granted
     // authorizes nothing, however well-formed it otherwise looks.
     if (!/^[a-f0-9]{64}$/.test(approval.approved_payload_hash ?? '')) {
@@ -138,14 +153,34 @@ function checkScope(tool, agent, payload) {
   return null;
 }
 
+/** `undefined`/`null`/`''` all mean "this approval does not declare this
+ * binding" — checked only when the field is genuinely present, so every
+ * pre-M18 approval record (none of which set agent_id/version_id/
+ * registry_sha) is completely unaffected. See DECISIONS.md D35. */
+function isBound(value) {
+  return typeof value === 'string' && value !== '';
+}
+
 /**
  * Per-item approval resolution.
  *
  * This is the ONLY step that changes when batch and standing-policy approvals
  * arrive (DECISIONS D7). Those become additional resolvers behind this same
  * signature; no calling code changes.
+ *
+ * M18 additions (DECISIONS.md D35), both additive and backward-compatible:
+ *   - `agent`/`registrySha` are new, OPTIONAL context. When an approval
+ *     record declares agent_id/version_id/registry_sha, this now checks
+ *     them against the CALLER's actual agent/version/registry — an
+ *     approval requested for one agent, version, or build cannot silently
+ *     authorize a different one. A record that never declares these
+ *     fields (every fixture before M18) is resolved exactly as before.
+ *   - a later record with `status: 'revoked'` and `approval_reference`
+ *     pointing at a granted approval's own `approval_id` supersedes it —
+ *     src/approval-engine.js creates revocations this way specifically so
+ *     the original 'approved' record is never mutated (D35).
  */
-function resolvePerItemApproval({ store, taskId, actionType, payload, now }) {
+function resolvePerItemApproval({ store, taskId, actionType, payload, now, agent, registrySha }) {
   const candidates = store.approvalsForTask(taskId);
   if (candidates.length === 0) return { state: 'MISSING' };
 
@@ -164,6 +199,19 @@ function resolvePerItemApproval({ store, taskId, actionType, payload, now }) {
   const granted = matching.find((a) => a.status === 'approved');
   if (!granted) return { state: 'NOT_GRANTED', detail: 'approval is pending or rejected' };
 
+  if (agent && isBound(granted.agent_id) && granted.agent_id !== agent.agent_id) {
+    return { state: 'AGENT_MISMATCH', detail: 'approval is bound to a different agent' };
+  }
+  if (agent && isBound(granted.version_id) && granted.version_id !== agent.version_id) {
+    return { state: 'VERSION_MISMATCH', detail: 'approval is bound to a different agent version' };
+  }
+  if (isBound(granted.registry_sha) && registrySha != null && granted.registry_sha !== registrySha) {
+    return { state: 'REGISTRY_MISMATCH', detail: 'approval is bound to a different registry SHA' };
+  }
+
+  const revocation = candidates.find((a) => a.status === 'revoked' && isBound(a.approval_reference) && a.approval_reference === granted.approval_id);
+  if (revocation) return { state: 'REVOKED', detail: 'approval was revoked' };
+
   if (granted.expires_at != null && granted.expires_at <= now) {
     return { state: 'EXPIRED', detail: 'approval expired' };
   }
@@ -179,8 +227,13 @@ function resolvePerItemApproval({ store, taskId, actionType, payload, now }) {
  * @param {object} deps.store
  * @param {object} deps.audit
  * @param {() => number} deps.clock  epoch ms, injected so expiry is testable
+ * @param {string|null} [deps.registrySha]  M18, optional, defaults to null
+ *   (every pre-M18 caller is unaffected). When supplied, an approval that
+ *   declares its own `registry_sha` is checked against it — see
+ *   resolvePerItemApproval's comment and DECISIONS.md D35. Not wired into
+ *   any default construction; a caller opts in by supplying it.
  */
-export function createBroker({ tools, store, audit, clock }) {
+export function createBroker({ tools, store, audit, clock, registrySha = null }) {
   /**
    * Decide. Never executes anything.
    * @returns {{decision:string, reason:string, ...}}
@@ -305,6 +358,8 @@ export function createBroker({ tools, store, audit, clock }) {
         actionType: action.action_type,
         payload: request.payload,
         now,
+        agent,
+        registrySha,
       });
       switch (resolution.state) {
         case 'MISSING':
@@ -315,6 +370,14 @@ export function createBroker({ tools, store, audit, clock }) {
           return settle(DECISION.DENY, REASON.APPROVAL_MISMATCH, resolution.detail);
         case 'NOT_GRANTED':
           return settle(DECISION.DENY, REASON.APPROVAL_NOT_GRANTED, resolution.detail);
+        case 'AGENT_MISMATCH':
+          return settle(DECISION.DENY, REASON.APPROVAL_AGENT_MISMATCH, resolution.detail);
+        case 'VERSION_MISMATCH':
+          return settle(DECISION.DENY, REASON.APPROVAL_VERSION_MISMATCH, resolution.detail);
+        case 'REGISTRY_MISMATCH':
+          return settle(DECISION.DENY, REASON.APPROVAL_REGISTRY_MISMATCH, resolution.detail);
+        case 'REVOKED':
+          return settle(DECISION.DENY, REASON.APPROVAL_REVOKED, resolution.detail);
         case 'EXPIRED':
           return settle(DECISION.DENY, REASON.APPROVAL_EXPIRED, resolution.detail);
         case 'GRANTED': {
