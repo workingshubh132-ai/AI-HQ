@@ -73,8 +73,16 @@ function checkEnvelope(envelope) {
  *   every handler that doesn't call a model — which, before M7, was all of
  *   them. Handlers that never reference `callModel` are unaffected by its
  *   presence or absence.
+ * @param {{createArtifactSync: Function}} [deps.artifactService]  optional,
+ *   M20. Omitted by every handler that doesn't produce an artifact —
+ *   which, before M20, was all of them. Handlers that never reference
+ *   `createArtifact` are unaffected by its presence or absence. Must be a
+ *   `createArtifactService()` instance constructed over the SAME
+ *   synchronous, in-memory store/artifactStore this runtime already
+ *   runs against (D28) — `createArtifactSync` throws loudly rather than
+ *   misbehave if handed an async (Postgres) one. See DECISIONS.md D37.
  */
-export function createRuntime({ store, broker, audit, clock, handlers, registrySha, modelRuntime }) {
+export function createRuntime({ store, broker, audit, clock, handlers, registrySha, modelRuntime, artifactService }) {
   /**
    * Runs one task to completion.
    * @returns {object} the final task record
@@ -210,9 +218,23 @@ export function createRuntime({ store, broker, audit, clock, handlers, registryS
       ? (request) => modelRuntime.invokeModel({ ...request, agent_slug, task_id, tree_id })
       : () => { throw new Error('no model runtime configured for this agent'); };
 
+    // The handler's only route to producing a content artifact (M20).
+    // Trusted execution context (agent_slug, workflow_id, task_id) is
+    // supplied by THIS closure, spread in AFTER the handler's own
+    // request — identical to callModel's pattern above — so a handler
+    // cannot make an artifact appear to belong to a different agent,
+    // workflow, or task by including those fields in its own request.
+    // createArtifactSync independently re-derives and validates
+    // everything regardless; this is defense in depth, not the only
+    // guard. See the artifact service module's own header and
+    // DECISIONS.md D37.
+    const createArtifact = artifactService
+      ? (request) => artifactService.createArtifactSync({ ...request, agent_slug, workflow_id: tree_id, task_id })
+      : () => { throw new Error('no artifact service configured for this agent'); };
+
     let envelope;
     try {
-      envelope = handler({ input, callTool, callModel, DECISION });
+      envelope = handler({ input, callTool, callModel, createArtifact, DECISION });
     } catch (err) {
       return fail(RUNTIME_REASON.HANDLER_ERROR, String(err.message));
     }

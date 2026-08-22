@@ -572,10 +572,13 @@ test('305. even if proposeTask\'s own routing-failure check were removed, addTas
   assert.equal(r.reason, WORKFLOW_REASON.MALFORMED_PROPOSAL);
 });
 
-test('306. a handler is structurally unable to reach the router at all — runtime.js hands it exactly four things, never the router or the coordinator', () => {
+test('306. a handler is structurally unable to reach the router at all — runtime.js hands it a fixed set, never the router or the coordinator', () => {
   const src = readFileSync(new URL('../src/runtime.js', import.meta.url), 'utf8');
   assert.ok(
-    src.includes('handler({ input, callTool, callModel, DECISION })'),
+    // M20 widened the fixed set to include createArtifact (see
+    // DECISIONS.md D37) — still no router, coordinator, or store
+    // reference, which is this test's actual claim.
+    src.includes('handler({ input, callTool, callModel, createArtifact, DECISION })'),
     'the one place a handler is ever invoked must pass exactly this fixed set — no router, no coordinator, no store',
   );
 });

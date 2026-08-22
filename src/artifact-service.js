@@ -44,16 +44,34 @@
  *
  * ── ASYNC BY DESIGN, LIKE M17/M18 — NOT WIRED INTO THE SYNCHRONOUS CORE ──
  *
- * Every store call here is `await`ed, deliberately, following the exact
- * fix M17's `agent-lifecycle.js` and M18's `approval-engine.js` made
- * after finding the same class of bug: an unawaited call against a real
- * async Postgres store returns a pending Promise, always truthy, which
- * silently defeats an `if (!x)` check. This file is not on
- * broker.js/runtime.js/workflow.js/router.js/guardian.js's synchronous
- * hot path (D28), so there is no boundary to preserve by staying
- * synchronous — being genuinely async is what makes it genuinely portable
- * to both the in-memory and Postgres artifact stores, proven directly by
- * running the same assertions against both.
+ * Every store call in `createArtifact` is `await`ed, deliberately,
+ * following the exact fix M17's `agent-lifecycle.js` and M18's
+ * `approval-engine.js` made after finding the same class of bug: an
+ * unawaited call against a real async Postgres store returns a pending
+ * Promise, always truthy, which silently defeats an `if (!x)` check.
+ * `createArtifact` is not on broker.js/runtime.js/workflow.js/router.js/
+ * guardian.js's synchronous hot path (D28), so there is no boundary to
+ * preserve by staying synchronous — being genuinely async is what makes
+ * it genuinely portable to both the in-memory and Postgres artifact
+ * stores, proven directly by running the same assertions against both.
+ *
+ * ── createArtifactSync — M20's ONE EXCEPTION, NARROWLY SCOPED ────────────
+ *
+ * M20 wires artifact creation into `runtime.js`'s handler execution,
+ * which is (D28) synchronous and always will be against anything but the
+ * in-memory store. A handler cannot `await` — it is called as a plain
+ * function — so it needs a genuinely synchronous entry point, not a
+ * Promise it cannot resolve inline. `createArtifactSync` is that entry
+ * point: the SAME validation rules (the same imported checks, the SAME
+ * `hasCycle` function below), called without `await`, safe ONLY against
+ * the in-memory store and the in-memory artifact store — which is all
+ * `runtime.js` ever runs against (D28), so this is an existing
+ * constraint restated, not a new one. It guards against its own misuse:
+ * if any store call returns something Promise-shaped (i.e., it was
+ * handed a real async store by mistake), it throws immediately rather
+ * than silently reading `undefined` off an unawaited Promise — the exact
+ * failure mode M17-M19 each found and fixed, closed here by construction
+ * instead of by discovery. See DECISIONS.md D37.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -112,6 +130,20 @@ function hasCycle(getArtifact, startId) {
   }
 
   return visit(startId);
+}
+
+/** Throws loudly if `value` looks like a Promise, rather than letting a
+ * synchronous caller silently treat a pending Promise as data — see
+ * `createArtifactSync`'s header comment above. */
+function assertNotPromise(value, where) {
+  if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
+    throw new Error(
+      `createArtifactSync: ${where} returned a Promise. createArtifactSync is only safe against ` +
+        'the synchronous in-memory store and artifact store — use the async createArtifact against ' +
+        'a Postgres-backed store instead.',
+    );
+  }
+  return value;
 }
 
 /**
@@ -321,6 +353,168 @@ export function createArtifactService({ store, artifactStore, audit, clock, regi
     return { outcome: 'created', code: ARTIFACT_REASON.OK, artifact: stored };
   }
 
+  /**
+   * The synchronous twin of `createArtifact` — same rules, same reason
+   * codes, same anti-impersonation and lineage checks, called without
+   * `await`. See this file's header ("createArtifactSync — M20's ONE
+   * EXCEPTION") for why this exists and what it must never be used
+   * against.
+   *
+   * @param {object} request
+   * @returns {{outcome:string, code:string, artifact?:object, detail?:string}}
+   */
+  function createArtifactSync(request = {}) {
+    const fail = (code, detail) => {
+      const record = { outcome: 'rejected', code, detail: detail ?? null };
+      writeAudit('artifact.rejected', record);
+      return record;
+    };
+
+    if (!request || typeof request !== 'object') return fail(ARTIFACT_REASON.MISSING_ARTIFACT_ID, 'request must be an object');
+
+    if (!isKnownArtifactType(request.artifact_type)) {
+      return fail(ARTIFACT_REASON.UNKNOWN_ARTIFACT_TYPE, request.artifact_type);
+    }
+
+    const status = request.status ?? ARTIFACT_STATUS.COMPLETE;
+    if (status !== ARTIFACT_STATUS.COMPLETE && status !== ARTIFACT_STATUS.FAILED) {
+      return fail(ARTIFACT_REASON.INVALID_STATUS, status);
+    }
+
+    if (!isNonEmptyString(request.workflow_id)) {
+      return fail(ARTIFACT_REASON.MISSING_WORKFLOW_ID);
+    }
+    const workflow_id = request.workflow_id;
+
+    if (!isNonEmptyString(request.agent_slug)) {
+      return fail(ARTIFACT_REASON.UNKNOWN_AGENT, 'agent_slug is required');
+    }
+    const agent = assertNotPromise(store.getAgent(request.agent_slug), 'store.getAgent');
+    if (!agent) return fail(ARTIFACT_REASON.UNKNOWN_AGENT, request.agent_slug);
+    const agent_id = agent.agent_id;
+    const version_id = agent.version_id ?? null;
+
+    let task_id = null;
+    if (request.task_id !== undefined && request.task_id !== null) {
+      if (!isNonEmptyString(request.task_id)) return fail(ARTIFACT_REASON.UNKNOWN_TASK, request.task_id);
+      const task = assertNotPromise(store.getTask(request.task_id), 'store.getTask');
+      if (!task) return fail(ARTIFACT_REASON.UNKNOWN_TASK, request.task_id);
+      const taskWorkflowId = task.workflow_id ?? task.tree_id ?? null;
+      if (taskWorkflowId !== workflow_id) return fail(ARTIFACT_REASON.TASK_WORKFLOW_MISMATCH, request.task_id);
+      task_id = request.task_id;
+    }
+
+    if (registrySha != null && !isNonEmptyString(registrySha)) {
+      return fail(ARTIFACT_REASON.INVALID_REGISTRY_SHA, registrySha);
+    }
+
+    const parentIdsInput = request.parent_artifact_ids ?? [];
+    if (!Array.isArray(parentIdsInput)) return fail(ARTIFACT_REASON.INVALID_PARENT_ID, 'parent_artifact_ids must be an array');
+    const parent_artifact_ids = [];
+    const syncGetArtifact = (id) => assertNotPromise(artifactStore.getArtifact(id), 'artifactStore.getArtifact');
+    for (const pid of parentIdsInput) {
+      if (!isNonEmptyString(pid)) return fail(ARTIFACT_REASON.INVALID_PARENT_ID, pid);
+      const parent = syncGetArtifact(pid);
+      if (!parent) return fail(ARTIFACT_REASON.PARENT_NOT_FOUND, pid);
+      if (parent.workflow_id !== workflow_id) return fail(ARTIFACT_REASON.CROSS_WORKFLOW_PARENT, pid);
+      parent_artifact_ids.push(pid);
+    }
+    // No async ancestry pre-caching needed here (unlike createArtifact):
+    // artifactStore.getArtifact is itself already synchronous against the
+    // in-memory store, so hasCycle can call it directly.
+    for (const pid of parent_artifact_ids) {
+      if (hasCycle(syncGetArtifact, pid)) return fail(ARTIFACT_REASON.CYCLIC_LINEAGE, pid);
+    }
+
+    const hasInline = request.content !== undefined && request.content !== null;
+    const hasRef = isNonEmptyString(request.content_ref);
+    let content = null;
+    let content_ref = null;
+    let mime_type = null;
+    let size = null;
+    let checksum = null;
+
+    if (status === ARTIFACT_STATUS.FAILED) {
+      if (hasInline || hasRef) return fail(ARTIFACT_REASON.INVALID_CONTENT, 'a FAILED artifact must carry no content');
+    } else {
+      if (hasInline === hasRef) {
+        return fail(ARTIFACT_REASON.INVALID_CONTENT, 'exactly one of content or content_ref is required');
+      }
+      if (!isValidMimeType(request.mime_type)) return fail(ARTIFACT_REASON.INVALID_MIME_TYPE, request.mime_type);
+      mime_type = request.mime_type;
+
+      if (hasInline) {
+        content = request.content;
+        checksum = checksumOf(content);
+        size = byteSizeOf(content);
+      } else {
+        content_ref = request.content_ref;
+        if (!Number.isInteger(request.size) || request.size < 0) {
+          return fail(ARTIFACT_REASON.INVALID_SIZE, request.size);
+        }
+        size = request.size;
+        if (!isValidChecksum(request.checksum)) return fail(ARTIFACT_REASON.INVALID_CHECKSUM, request.checksum);
+        checksum = request.checksum;
+      }
+    }
+
+    for (const [key, value] of Object.entries({
+      provider_id: request.provider_id, provider_version: request.provider_version, model_id: request.model_id,
+    })) {
+      if (value !== undefined && value !== null && !isNonEmptyString(value)) {
+        return fail(ARTIFACT_REASON.INVALID_PROVIDER_METADATA, key);
+      }
+    }
+    if (!isSerializableMetadata(request.generation_metadata ?? null)) {
+      return fail(ARTIFACT_REASON.INVALID_PROVIDER_METADATA, 'generation_metadata');
+    }
+
+    const approval_status = request.approval_status ?? ARTIFACT_APPROVAL_STATUS.NOT_REQUIRED;
+    if (!Object.values(ARTIFACT_APPROVAL_STATUS).includes(approval_status)) {
+      return fail(ARTIFACT_REASON.INVALID_APPROVAL_STATUS, approval_status);
+    }
+
+    const artifact_id = generateArtifactId();
+    const created_at = clock();
+
+    const provenance = {
+      agent_id, version_id, workflow_id, task_id, registry_sha: registrySha,
+      parent_artifact_ids, provider_id: request.provider_id ?? null,
+      provider_version: request.provider_version ?? null, model_id: request.model_id ?? null,
+    };
+
+    const artifact = {
+      artifact_id,
+      artifact_type: request.artifact_type,
+      status,
+      workflow_id,
+      task_id,
+      agent_id,
+      version_id,
+      registry_sha: registrySha,
+      parent_artifact_ids,
+      content,
+      content_ref,
+      mime_type,
+      size,
+      checksum,
+      created_at,
+      provenance,
+      provider_id: request.provider_id ?? null,
+      provider_version: request.provider_version ?? null,
+      model_id: request.model_id ?? null,
+      generation_metadata: request.generation_metadata ?? null,
+      approval_status,
+    };
+
+    const stored = assertNotPromise(artifactStore.addArtifact(artifact), 'artifactStore.addArtifact');
+    writeAudit('artifact.created', {
+      outcome: 'created', code: ARTIFACT_REASON.OK, artifact_id, artifact_type: artifact.artifact_type,
+      agent_id, version_id, workflow_id, task_id, checksum,
+    });
+    return { outcome: 'created', code: ARTIFACT_REASON.OK, artifact: stored };
+  }
+
   async function getArtifact(artifact_id) {
     return artifactStore.getArtifact(artifact_id);
   }
@@ -359,7 +553,7 @@ export function createArtifactService({ store, artifactStore, audit, clock, regi
     return { artifact, ancestors };
   }
 
-  return { createArtifact, getArtifact, childrenOf, lineageOf };
+  return { createArtifact, createArtifactSync, getArtifact, childrenOf, lineageOf };
 }
 
 /** Populates `cache` with `artifactId` and every ancestor reachable from

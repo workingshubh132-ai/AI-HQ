@@ -1900,6 +1900,172 @@ network primitive, no credential.
 
 ---
 
+## D37 — Real artifact execution: one closure in runtime.js, one synchronous twin in artifact-service.js, nothing else touched
+
+Decided 2026-08-22 (Milestone 20).
+
+M19 built the artifact contract, storage, and service with nothing yet
+calling it from real task execution. M20 closes that gap with the
+smallest change inspection could justify: `runtime.js` gains one
+optional constructor dependency (`artifactService`) and one closure
+(`createArtifact`), built and passed to the handler exactly the way
+`callModel`/`modelRuntime` already are. `broker.js`, `workflow.js`,
+`router.js`, `guardian.js`, `approval-engine.js`, `resource-governor.js`,
+and `execution-coordinator.js` are all confirmed unchanged (`git diff
+--stat` lists only `runtime.js`, `artifact-service.js`, three test files
+updated for one literal string, and two new files).
+
+**Why `runtime.js` needed a change at all, and why the smaller
+alternatives don't work.** Two designs were considered and rejected
+before this one:
+
+1. *Call the existing async `createArtifact` from inside `runTask`.*
+   `runTask` is synchronous (D28); calling an `async` function without
+   `await` returns a Promise, not the result — the exact bug class
+   M17-M19 each already found and fixed, here at the point of design
+   rather than discovery. Making `runTask` genuinely `async` to fix that
+   would cascade into `workflow.js`'s `step()` (which calls
+   `runtime.runTask()` synchronously and uses the result the same tick)
+   and `execution-coordinator.js`, and from there into roughly 40
+   pre-existing test call sites — a materially larger, higher-risk
+   change than "wire in artifact creation," and exactly the kind of
+   rewrite this project has repeatedly deferred rather than force
+   through a milestone that didn't need it.
+2. *Validate artifacts AFTER `workflow.step()` reports a task COMPLETED,
+   patching the status if invalid.* This fails on the last task in a
+   workflow: `workflow.step()` computes `workflow.state` from the
+   task's COMPLETED status in the SAME call, and once a workflow reaches
+   a terminal state its own `step()` short-circuits on every future
+   call (`if (TERMINAL_STATES.has(workflow.state)) return ...`) —
+   there is no code path to reopen it, by design, and inventing one
+   would be a real, separate architectural change to `workflow.js`.
+   A late correction could arrive too late to matter for the run that
+   needed it.
+
+Given both alternatives required either rewriting the synchronous core
+or reopening a workflow.js invariant, the smallest honest fix is a
+closure `runtime.js` already builds one of (`callModel`) and hands to
+the handler alongside it — same shape, same "optional, ignored unless
+referenced" contract, same anti-impersonation pattern (trusted context
+spread in AFTER the handler's own request, so it always wins).
+
+**`createArtifactSync` — a second, synchronous entry point on the SAME
+service object, not a second artifact-creation interface.** A handler is
+a plain function; it cannot `await`. `artifact-service.js` gained
+`createArtifactSync`, mirroring `createArtifact`'s exact validation
+sequence — the same imported checks from `artifacts.js`, the same
+`hasCycle` function (now exported for reuse rather than reimplemented)
+— but calling `store`/`artifactStore` without `await`. This is safe only
+against the synchronous in-memory pair, which is the ONLY pair
+`runtime.js` (D28) has ever run against — a pre-existing constraint
+restated, not a new one. To make a silent misuse impossible rather than
+merely undocumented, `createArtifactSync` wraps every store call in
+`assertNotPromise()`: if a caller mistakenly constructs the service over
+Postgres-backed stores and calls the sync path, it throws immediately —
+proven against a real Postgres database, not a mock (test 484) — instead
+of quietly reading `undefined` off an unawaited Promise. The existing
+async `createArtifact` is byte-for-byte unchanged; every one of M19's 50
+tests still passes against it, unmodified, because nothing about it was
+touched.
+
+**Artifact-creation failure fails the task through the EXISTING
+`HANDLER_ERROR` path — no new reason code, no new completion branch.**
+`runtime.js`'s own `try { envelope = handler(...) } catch (err) { return
+fail(RUNTIME_REASON.HANDLER_ERROR, ...) }` already exists and is already
+in `workflow.js`'s `RETRYABLE_REASONS`. The demo pipeline agents'
+`requireCreated()` helper throws when `createArtifact()` returns
+anything other than `outcome: 'created'`; runtime.js's unmodified catch
+block takes it from there. "The task must not become COMPLETED if its
+artifact contract is invalid" (the M20 directive's own requirement) is
+satisfied by code that predates this milestone by five milestones —
+recognizing that was the actual design work, not writing new
+completion-path logic.
+
+**The task tree and the artifact DAG are not required to have the same
+shape — and treating them as if they must was the wrong turn this
+milestone's design took first.** The obvious way to wire a 6-stage
+pipeline (research→script→audio→image→video→captions) is `workflow.js`'s
+existing `proposed_child_tasks` mechanism (unchanged since M8): a
+handler's envelope can include child task proposals with real data only
+known after it executes — exactly what chaining artifact IDs forward
+needs, since a task's `input` is fixed at admission time and no
+downstream stage's real parent ID exists yet when an upstream stage is
+proposed. Six strictly sequential self-proposed children reach task
+depth 5, past `limits.js`'s real, unmodified `MAX_DEPTH` (4) — discovered
+by hitting `RUNTIME_REASON.DEPTH_EXCEEDED` directly, not by inspection.
+Rather than weaken that ceiling, the TASK chain and the ARTIFACT DAG were
+decoupled: `visual`'s task proposes `video` and `caption` as two
+siblings at depth 4 (not depth 5), while `video`'s ARTIFACT still
+declares two real parents — the audio and image artifacts — passed
+through the linear task chain's inputs. The task tree is a simple line
+with one two-way fan-out at the end; the artifact lineage is a genuine
+diamond. `caption`'s artifact is parented on the SCRIPT artifact rather
+than VIDEO for the same reason (real subtitle generation typically works
+from a transcript plus audio timing, not the rendered file) — a
+deliberate adaptation to the depth ceiling, not a workaround of it.
+Proven end to end in one `runToCompletion()` call (test 472): 6 real
+artifacts, a genuine 2-parent VIDEO, max task depth exactly 4.
+
+**Approval remains completely independent of artifact creation — proven
+by giving a demo handler both jobs in the same task.** `publishHandler`
+(defined in the test file, not the demo agent file, since it exists only
+to prove this boundary) creates a SOCIAL_PACKAGE artifact, unconditionally,
+then calls `fake.send_message` (YELLOW tier) via the unmodified `callTool`.
+Without an approval on file, the artifact is created and the tool call
+returns `NEEDS_APPROVAL` (test 464); after a real M18 `approvalEngine.decide()`,
+the identical tool call returns `ALLOW` (test 465) — and the artifact was
+created in BOTH cases, proving it never depended on, and never
+substituted for, the approval. A handler setting `approval_status:
+'approved'` directly on its own artifact request (test 476) changes
+nothing about what the Broker requires — that field is descriptive data,
+read by nobody in the authorization path.
+
+**Documented atomicity limitation, not fake transaction semantics.**
+`createArtifactSync` (and `createArtifact`) make ONE artifact's creation
+atomic: full validation before any write, so a rejected request writes
+nothing. A HANDLER creating multiple artifacts across multiple calls is
+NOT transactionally atomic across those calls — if the second of two
+`createArtifact()` calls in one handler fails, the first artifact it
+already created remains, a real, valid, immutable record, even though
+the task as a whole is marked FAILED (test 459). Achieving true
+multi-artifact atomicity would need either a batched creation API (not
+requested, not built) or a real database transaction spanning the whole
+handler body (impossible for the in-memory store and a materially larger
+change for Postgres). Documented rather than pretended away, per the
+M20 directive's own explicit instruction.
+
+**Mutation testing found a real test-precision gap, not a code gap.**
+Disabling `createArtifactSync`'s `PARENT_NOT_FOUND` check alone did not
+initially fail any test — not because the check is unnecessary, but
+because the very next line (`parent.workflow_id`) reads a property off
+`null` and throws a TypeError, which `runtime.js`'s existing catch block
+converts into the identical `HANDLER_ERROR`/`FAILED` outcome as the
+correct, controlled rejection. The mutation was invisible to tests that
+only asserted "the task failed," not "the task failed for THIS specific,
+documented reason." Fixed by asserting the failure detail contains the
+specific `ARTIFACT_REASON` code (tests 453/454) — the same fix applies
+symmetrically to the cross-workflow check, and a second, unrelated test
+bug (test 454 originally used two fully separate in-memory artifact
+stores, so the "cross-workflow" parent didn't exist in the second store
+at all, making the assertion pass for the wrong reason —
+`PARENT_NOT_FOUND` instead of `CROSS_WORKFLOW_PARENT`) was found and
+fixed the same way, by making the mutation-testing failure legible
+rather than declaring the check untestable.
+
+**What this milestone deliberately does not do.** No real model,
+provider, or media-generation call of any kind — the six demo agents are
+pure deterministic functions producing small fixture JSON, and a
+structural test (482) confirms none of them reference `callModel(`. No
+Resource Governor involvement, because nothing here calls a model to
+govern — fabricating a token cost to "prove" governor integration was
+explicitly rejected by the M20 directive and not done. No artifact-level
+read access control (same deferred boundary M19 already documented,
+unchanged by this milestone). No change to `MAX_DEPTH`, `MAX_FANOUT`, or
+`MAX_TOTAL_NODES`. No new dependency, no network primitive, no
+credential, no paid API call.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

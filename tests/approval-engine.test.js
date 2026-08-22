@@ -155,7 +155,10 @@ test('358. (#6, #7, #8) decide()/revoke() are reachable only from outside task e
   // already prove is never widened).
   const runtimeSrc = readFileSync(new URL('../src/runtime.js', import.meta.url), 'utf8');
   assert.ok(!runtimeSrc.includes('approval-engine'), 'runtime.js must not import or reference the approval engine');
-  assert.ok(runtimeSrc.includes('handler({ input, callTool, callModel, DECISION })'));
+  // M20 widened the fixed set to include createArtifact (see
+  // DECISIONS.md D37) — still no approval-engine reference, this test's
+  // actual claim.
+  assert.ok(runtimeSrc.includes('handler({ input, callTool, callModel, createArtifact, DECISION })'));
 
   // Behavioral: a handler whose OUTPUT looks exactly like a self-granted
   // approval decision has zero effect on any real approval's state — the

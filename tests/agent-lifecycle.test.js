@@ -321,7 +321,10 @@ test('339. a handler is structurally unable to reach the lifecycle module — ru
   const src = readFileSync(new URL('../src/runtime.js', import.meta.url), 'utf8');
   assert.ok(!src.includes('agent-lifecycle'), 'runtime.js must not import or reference the lifecycle module at all');
   assert.ok(
-    src.includes('handler({ input, callTool, callModel, DECISION })'),
+    // M20 widened the fixed set to include createArtifact (see
+    // DECISIONS.md D37) — still no lifecycle module reference, which is
+    // this test's actual claim.
+    src.includes('handler({ input, callTool, callModel, createArtifact, DECISION })'),
     'the one place a handler is invoked must pass exactly this fixed set',
   );
 });
