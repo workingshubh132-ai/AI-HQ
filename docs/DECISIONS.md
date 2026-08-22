@@ -1297,6 +1297,72 @@ M14 directive's own example authorization-shaped output).
 
 ---
 
+## D32 — Guardian: a failure-reason-specific policy, not a redesign
+
+Decided 2026-08-22 (Milestone 15).
+
+Inspection of `guardian.js` going into M15 found 7 of the 8 requested signal
+types already real and already mutation-tested: budget exhaustion (global,
+hard; per-agent, soft), agent failure rate, workflow failure rate,
+authorization-denial spikes, retry storms, and model-resource failures
+(M13) — covering all three freeze scopes (agent/workflow/global), already
+wired into live execution via the M14 execution coordinator's `runStep()`,
+already structurally proven unable to self-approve, touch the Broker,
+grant clearance, modify version state, or access credentials. The one
+genuine gap: the M15 directive names "repeated failures" and "repeated
+handler failures" as two distinct signals, but `evaluateAgentFailureRate`
+counted every `runtime.task` failure identically regardless of
+`failure_reason_code` — an agent failing because it is already frozen,
+holds an unapproved version, or exceeded depth counted exactly the same
+as an agent whose own handler code is genuinely broken.
+
+**`evaluateHandlerFailureRate(agent_slug)` isolates that second, narrower
+signal — from data the audit log already carries.** `runtime.js`'s
+`fail(reason, detail)` already writes the exact `RUNTIME_REASON` code
+into the `reason` field of every `runtime.task` audit record; this policy
+filters on `reason === 'HANDLER_ERROR'` specifically, rather than
+widening the general check's own threshold semantics. No new
+instrumentation was added anywhere — the same "evidence is the audit
+log, not a new observation channel" principle every other Guardian policy
+already follows. Test 313 proves the distinction directly: 2 `HANDLER_
+ERROR` failures plus 2 failures of other reasons (4 total, above the
+general check's own threshold of 3) do not trip this narrower check,
+which requires 3 of the *same* reason.
+
+**In practice, the general check will usually freeze first — this is
+correct, not a defect.** Because handler failures are a subset of all
+failures and both checks share the same window/threshold (5/3),
+`evaluateAgentFailureRate` — which runs first in `evaluate()`'s per-agent
+loop — will almost always reach its own threshold at or before this
+narrower one does, and `impose()`'s existing idempotency (`ALREADY_
+FROZEN`, unchanged since M10) makes the second call a no-op. Test 316
+documents this honestly rather than asserting an outcome that depends on
+internal ordering: what must hold is that the agent ends up frozen and
+the check genuinely ran, not that *this specific* check performed the
+freeze. The check's value is in the *reason it records* when called
+directly (a genuinely broken handler, vs. an agent that was merely
+never eligible to run) — useful for anyone diagnosing why an agent was
+frozen, exactly the observability this milestone's own "why was this
+action allowed or denied" goal asks for.
+
+**"Suspicious execution patterns" was named in the M15 directive but not
+implemented.** No concrete criterion was given for what makes a pattern
+"suspicious" beyond the other seven signals already covered. Rather than
+invent a heuristic, this is reported as NOT IMPLEMENTED — consistent with
+the explicit instruction not to create features that merely pretend to be
+capability, and with "do not add speculative architecture."
+
+**What this milestone deliberately does not do.** It does not modify
+`impose()`, `recent()`, `knownWorkflowIds()`, or any of the other 7
+existing policies. It does not touch `broker.js`, `runtime.js`,
+`router.js`, `workflow.js`, or `execution-coordinator.js` — Guardian's
+existing wiring into live execution (M14, D31) already calls `evaluate()`
+at the right point, and this policy rides along inside that unchanged
+call. It does not add a persistence method, a dependency, a credential,
+or a network primitive.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

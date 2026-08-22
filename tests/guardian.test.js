@@ -267,6 +267,101 @@ test('217. a failing workflow does not cause Guardian to freeze an unrelated wor
   assert.equal(store.activeFreeze('workflow', 'wf-B', T0), null);
 });
 
+// ── 8. repeated HANDLER-classified failures, specifically (M15) ─────────
+
+test('309. below the handler-failure threshold, the agent is not frozen', () => {
+  const { store, runtime, guardian } = stackSetup({ handlers: { [S.RESEARCH]: () => { throw new Error('boom'); } } });
+  runN(runtime, store, S.RESEARCH, 'tree1', 2);
+  const r = guardian.evaluateHandlerFailureRate(S.RESEARCH);
+  assert.equal(r.imposed, false);
+  assert.equal(store.activeFreeze('agent', S.RESEARCH, T0), null);
+});
+
+test('310. at the handler-failure threshold, Guardian freezes the agent with a distinct reason', () => {
+  const { store, runtime, guardian } = stackSetup({ handlers: { [S.RESEARCH]: () => { throw new Error('boom'); } } });
+  runN(runtime, store, S.RESEARCH, 'tree1', 3);
+  const r = guardian.evaluateHandlerFailureRate(S.RESEARCH);
+  assert.equal(r.imposed, true);
+  assert.equal(r.reason, GUARDIAN_REASON.HANDLER_FAILURE_RATE_EXCEEDED);
+  assert.ok(store.activeFreeze('agent', S.RESEARCH, T0));
+});
+
+test('311. a Guardian handler-failure freeze is immediately enforced by the Broker and runtime.js', () => {
+  const { store, broker, runtime, guardian } = stackSetup({ handlers: { [S.RESEARCH]: () => { throw new Error('boom'); } } });
+  runN(runtime, store, S.RESEARCH, 'tree1', 3);
+  guardian.evaluateHandlerFailureRate(S.RESEARCH);
+
+  const decision = broker.authorize({ agent_slug: S.RESEARCH, tool_id: 'text.wordcount', payload: { text: 'x' } });
+  assert.equal(decision.decision, 'DENY');
+  assert.equal(decision.reason, 'AGENT_FROZEN');
+
+  store.createTaskBudgets({ task_id: 'after-freeze', tree_id: 'tree1', agent_slug: S.RESEARCH, limit: 100 });
+  const result = runtime.runTask({ agent_slug: S.RESEARCH, input: { text: 'x' }, task_id: 'after-freeze', tree_id: 'tree1' });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.failure_reason_code, 'AGENT_FROZEN');
+});
+
+test('312. structural (non-handler) failures never trip the handler-failure check, even at the same volume that trips the general one', () => {
+  // Three failures, none of them HANDLER_ERROR — e.g. the agent is
+  // already frozen for an unrelated reason, so every attempt fails
+  // AGENT_FROZEN. The general agent_failure_rate check (#1) would count
+  // these identically to a real handler bug; this narrower check must not.
+  const { store, audit, clock, guardian } = stackSetup();
+  store.addFreeze({ scope: 'agent', target_id: S.ANALYSIS, reason: 'pre-existing', imposed_by: 'test', imposed_at: T0, expires_at: null });
+  for (let i = 0; i < 3; i++) {
+    audit.write({ event: 'runtime.task', at: clock(), tree_id: 'tree1', agent_slug: S.ANALYSIS, status: 'failed', reason: 'AGENT_FROZEN' });
+  }
+  const r = guardian.evaluateHandlerFailureRate(S.ANALYSIS);
+  assert.equal(r.imposed, false, 'AGENT_FROZEN failures are not handler failures');
+});
+
+test('313. a mix of failure reasons only counts the HANDLER_ERROR ones toward the threshold', () => {
+  const { store, audit, clock, guardian } = stackSetup();
+  audit.write({ event: 'runtime.task', at: clock(), tree_id: 'tree1', agent_slug: S.WRITING, status: 'failed', reason: 'HANDLER_ERROR' });
+  audit.write({ event: 'runtime.task', at: clock(), tree_id: 'tree1', agent_slug: S.WRITING, status: 'failed', reason: 'HANDLER_ERROR' });
+  audit.write({ event: 'runtime.task', at: clock(), tree_id: 'tree1', agent_slug: S.WRITING, status: 'failed', reason: 'INPUT_CONTRACT_VIOLATION' });
+  audit.write({ event: 'runtime.task', at: clock(), tree_id: 'tree1', agent_slug: S.WRITING, status: 'failed', reason: 'BUDGET_MISSING' });
+  const r = guardian.evaluateHandlerFailureRate(S.WRITING);
+  assert.equal(r.imposed, false, 'only 2 of the 4 recent failures are HANDLER_ERROR — below the threshold of 3');
+  assert.equal(store.activeFreeze('agent', S.WRITING, T0), null);
+});
+
+test('314. Guardian freezing an agent for handler failures never touches that agent\'s clearance, tools, or version state', () => {
+  const { store, runtime, guardian } = stackSetup({ handlers: { [S.RESEARCH]: () => { throw new Error('boom'); } } });
+  const before = store.getAgent(S.RESEARCH);
+  runN(runtime, store, S.RESEARCH, 'tree1', 3);
+  guardian.evaluateHandlerFailureRate(S.RESEARCH);
+  const after = store.getAgent(S.RESEARCH);
+  assert.equal(after.clearance, before.clearance);
+  assert.deepEqual(after.allowed_tools, before.allowed_tools);
+  assert.equal(after.version_state, before.version_state);
+  assert.equal(after.version_id, before.version_id);
+});
+
+test('315. a handler-failing agent does not cause Guardian to freeze an unrelated, healthy agent', () => {
+  const { store, runtime, guardian } = stackSetup({ handlers: { [S.RESEARCH]: () => { throw new Error('boom'); } } });
+  runN(runtime, store, S.RESEARCH, 'tree1', 3);
+  guardian.evaluateHandlerFailureRate(S.RESEARCH);
+  const healthy = guardian.evaluateHandlerFailureRate(S.WRITING);
+  assert.equal(healthy.imposed, false);
+  assert.equal(store.activeFreeze('agent', S.WRITING, T0), null);
+});
+
+test('316. evaluate() runs the handler-failure check for every known agent automatically', () => {
+  const { store, runtime, guardian } = stackSetup({ handlers: { [S.RESEARCH]: () => { throw new Error('boom'); } } });
+  runN(runtime, store, S.RESEARCH, 'tree1', 3);
+  const result = guardian.evaluate();
+  const check = result.results.find((r) => r.check === 'handler_failure_rate' && r.target_id === S.RESEARCH);
+  assert.ok(check, 'evaluate() must include this check without being asked directly');
+  // Whether THIS check's own imposed flag is true depends on evaluate()'s
+  // internal ordering — the general agent_failure_rate check (#1) trips
+  // on the same 3 failures and may freeze first, making this check's own
+  // impose() call correctly a no-op (idempotency, per test 208). What
+  // must hold regardless is that the agent ends up frozen and this check
+  // genuinely ran.
+  assert.ok(store.activeFreeze('agent', S.RESEARCH, T0));
+});
+
 // ── Guardian cannot grant authority ──────────────────────────────────────
 
 test('218. Guardian freezing an agent never touches that agent\'s clearance, tools, or version state', () => {

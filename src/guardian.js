@@ -63,6 +63,8 @@ export const GUARDIAN_POLICY = Object.freeze({
   SOFT_FREEZE_COOLDOWN_MS: 15 * 60 * 1000, // 15 minutes; a placeholder duration, not tuned against real traffic
   MODEL_RESOURCE_FAILURE_WINDOW: 5, // M13 — repeated resource-governor denials/failures for one agent
   MODEL_RESOURCE_FAILURE_THRESHOLD: 3,
+  HANDLER_FAILURE_WINDOW: 5, // M15 — repeated HANDLER_ERROR-classified task failures specifically
+  HANDLER_FAILURE_THRESHOLD: 3,
 });
 
 export const GUARDIAN_REASON = Object.freeze({
@@ -73,6 +75,7 @@ export const GUARDIAN_REASON = Object.freeze({
   GLOBAL_BUDGET_EXHAUSTED: 'GLOBAL_BUDGET_EXHAUSTED',
   AGENT_BUDGET_WARNING: 'AGENT_BUDGET_WARNING',
   MODEL_RESOURCE_FAILURE_SPIKE: 'MODEL_RESOURCE_FAILURE_SPIKE', // M13
+  HANDLER_FAILURE_RATE_EXCEEDED: 'HANDLER_FAILURE_RATE_EXCEEDED', // M15
 });
 
 /**
@@ -218,6 +221,34 @@ export function createGuardian({ store, audit, clock, policy = GUARDIAN_POLICY }
     return { imposed: false };
   }
 
+  // ── 8. repeated HANDLER-classified failures, specifically (M15) ────────
+  //
+  // evaluateAgentFailureRate (#1) counts EVERY 'failed' runtime.task
+  // record for an agent, regardless of why: AGENT_FROZEN, VERSION_NOT_
+  // APPROVED, DEPTH_EXCEEDED, INPUT_CONTRACT_VIOLATION, and BUDGET_MISSING
+  // all count exactly the same as HANDLER_ERROR. That conflates "this
+  // agent was never eligible to run" (a structural/config fact, already
+  // separately guarded — a frozen agent can't be re-frozen, an unapproved
+  // version is already excluded by the router) with "this agent's own
+  // handler code is actually broken." This policy isolates the second,
+  // narrower signal — reusing runtime.js's own `reason` field on the
+  // 'runtime.task' audit event (already exactly the RUNTIME_REASON code;
+  // no new instrumentation, per this file's own "evidence is the audit
+  // log" discipline) rather than widening #1's threshold semantics.
+  function evaluateHandlerFailureRate(agent_slug) {
+    const window = recent('runtime.task', 'agent_slug', agent_slug, policy.HANDLER_FAILURE_WINDOW)
+      .filter((r) => r.status === 'completed' || r.status === 'failed');
+    const handlerFailures = window.filter((r) => r.status === 'failed' && r.reason === 'HANDLER_ERROR').length;
+    writeAudit('guardian.check', { check: 'handler_failure_rate', target_id: agent_slug, window: window.length, handlerFailures });
+    if (handlerFailures >= policy.HANDLER_FAILURE_THRESHOLD) {
+      return impose({
+        scope: 'agent', target_id: agent_slug, reason: GUARDIAN_REASON.HANDLER_FAILURE_RATE_EXCEEDED,
+        detail: `${handlerFailures}/${window.length} recent tasks failed with HANDLER_ERROR`,
+      });
+    }
+    return { imposed: false };
+  }
+
   /** Every tree/workflow id Guardian has ever observed in the audit log —
    * it has no other way to enumerate workflows, since (per D25) workflow
    * records live in workflow.js's own closure, not in store. */
@@ -238,6 +269,7 @@ export function createGuardian({ store, audit, clock, policy = GUARDIAN_POLICY }
       results.push({ check: 'authorization_denials', target_id: agent.slug, ...evaluateAuthorizationDenials(agent.slug) });
       results.push({ check: 'agent_budget_warning', target_id: agent.slug, ...evaluateAgentBudgetWarning(agent.slug) });
       results.push({ check: 'model_resource_failures', target_id: agent.slug, ...evaluateModelResourceFailures(agent.slug) });
+      results.push({ check: 'handler_failure_rate', target_id: agent.slug, ...evaluateHandlerFailureRate(agent.slug) });
     }
     for (const treeId of knownWorkflowIds()) {
       results.push({ check: 'workflow_failure_rate', target_id: treeId, ...evaluateWorkflowFailureRate(treeId) });
@@ -256,5 +288,6 @@ export function createGuardian({ store, audit, clock, policy = GUARDIAN_POLICY }
     evaluateGlobalBudget,
     evaluateAgentBudgetWarning,
     evaluateModelResourceFailures,
+    evaluateHandlerFailureRate,
   };
 }
