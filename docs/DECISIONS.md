@@ -3141,6 +3141,178 @@ test 807 withdraws authorization between two calls and asserts the second
 sends nothing. Connecting Groq to the CEO or the Content Factory remains
 a separate milestone, separately reviewed.
 
+## D45 — One live Content Factory stage: govern first, then hand over a sealed ticket
+
+Decided 2026-08-23 (Milestone 28).
+
+M28 connects exactly ONE Content Factory stage to the governed Groq
+boundary. Eleven specialists, the orchestrator, and the CEO are unchanged
+and remain entirely deterministic.
+
+**No protected file was modified.** `broker.js`, `validator.js`,
+`runtime.js`, `workflow.js`, `router.js`, `guardian.js`,
+`approval-engine.js`, `execution-coordinator.js`, `resource-governor.js`,
+`ceo-agent.js`, `src/ceo/`, and `content-factory-orchestrator.js` are all
+byte-identical to the milestone's start commit.
+
+### The two facts that shaped everything
+
+**First: `runtime.js` takes `provider_id` and `model_id` straight from
+the handler's request.** Read `generateContent` — the request fields pass
+through to `providerInvoker.invoke()` verbatim. The only thing preventing
+any of the twelve specialists (or the adversarial rogue fixture) from
+writing `provider_id: 'groq'` today is that the registry handed to the
+runtime does not contain Groq. Provider selection was controlled by WHICH
+REGISTRY WAS INJECTED, not by any per-agent rule. Hand the Content
+Factory a registry containing Groq and every stage could spend money.
+
+**Second: the live provider is asynchronous and `runtime.js` is
+synchronous**, deliberately, since D28. A live stage cannot make its
+network call inside a handler at all.
+
+### Why not an async runtime twin
+
+The established answer to the sync/async boundary is a twin file
+(`model-runtime` → `async-model-runtime`, `invoke` → `invoke-async`,
+`createArtifact` → `createArtifactSync`). A twin of `runtime.js` would be
+different in kind: it would duplicate the whole pre-flight — freeze
+checks, lifecycle, version resolution, Broker calls, task-record
+construction — and every one of those is a security boundary that would
+then exist twice and be free to drift. That is a worse outcome than the
+problem it solves, and far more than "the smallest secure
+implementation."
+
+### The design: govern in phase 1, hand over a sealed ticket to phase 2
+
+The network call moves OUT of the synchronous handler and in FRONT of it,
+where async is allowed and where the governance already lives:
+
+```
+PHASE 1 (async, before the task runs)
+  capability admission → is this agent the configured live stage?
+  live-guard (M26)     → global/workflow/agent freeze, lifecycle,
+                         version approved
+  resource governor    → call ceiling, budget at global→agent→workflow→task
+  invoke-async         → timeout, retries pinned to 0
+  groq adapter         → the one and only network egress
+────────────────────────────────────────────────────────────────────────
+PHASE 2 (sync, inside the UNMODIFIED runtime.js)
+  the handler calls generateContent() exactly as every other stage does;
+  a facade returns the already-governed result, and runtime.js builds the
+  artifact through its own artifact-bridge and artifact-service path
+```
+
+Provenance is therefore derived by trusted code M28 never touches:
+`agent_id`, `version_id`, `registry_sha`, `workflow_id`, `task_id` all
+come from the task record, and a handler forging them changes nothing
+(test 810).
+
+**The ticket is sealed three ways.** It is bound to the admitted agent;
+it carries a fingerprint of the exact request governance approved; and it
+is single-use. "At most one provider call per task" is therefore
+structural — there is no second result to hand out — rather than a limit
+someone has to remember to check.
+
+### The sentinel, and why provider selection is not a request field
+
+A live-capable handler names `cf-live-text`, which is deliberately NOT a
+registered provider. Writing `provider_id: 'groq'` reaches nothing,
+because no registry the Content Factory holds contains Groq (test 818).
+The sentinel names an INTENT; what it resolves to — which provider, which
+model — comes from operator configuration, never from the request. Phase
+1 passes `config.provider_id` and `config.model_id`, and the request's
+own values are ignored outright.
+
+### Admission is capability-based, and capability is not a grant
+
+The rule is: the agent's APPROVED, immutable active version must declare
+the configured capability, AND the configuration must bind that agent.
+
+Capabilities are advisory to the ROUTER, and that does not change.
+Routing advice decides who is asked to do work; this decides whether an
+already-routed, already-approved agent may reach a boundary that is
+independently gated four more times. Holding the capability is necessary,
+never sufficient — live-guard, the governor, and the provider's own
+configuration gates all still run and can each refuse. And because
+declaring a capability requires an approved version, the admission rule
+is backed by the human approval system rather than by agent-supplied
+data.
+
+**The live stage was given its own capability, `cf-script-live`, distinct
+from `cf-script`.** An existing test (561) caught the first attempt,
+where it shared the deterministic stage's capability — and it was right
+to. Two agents declaring `cf-script` would leave the router free to send
+an ordinary deterministic run to the agent that spends real money. The
+test's invariant was correct and the design was wrong.
+
+### Four new reason codes, and why each is genuinely new
+
+Everything the existing layers already express — freezes, lifecycle,
+budgets, call limits, provider and model failures, configuration gates —
+is passed through with the reason those layers produced. Four refusals
+belong to this boundary and had no existing expression:
+
+| Code | Why nothing existing fits |
+| --- | --- |
+| `LIVE_STAGE_NOT_CONFIGURED` | The safe default: no live stage exists. Not a failure of anything. |
+| `LIVE_STAGE_NOT_ADMITTED` | The caller is not the configured stage. Distinct from `PROVIDER_NOT_FOUND` (the provider exists) and from any Guardian reason (nothing is frozen). |
+| `LIVE_REQUEST_MISMATCH` | The handler asked for content governance did not approve. No existing code means "you may call, but not for that." |
+| `LIVE_TICKET_ALREADY_USED` | A second call in one task. `MODEL_CALL_LIMIT` is the governor's own ceiling; this is the handoff's. |
+
+### What the fingerprint covers, and the two fields it deliberately omits
+
+`model_id` is omitted because the model is trusted configuration and a
+request has no say in it — comparing it to a request field would compare
+config to noise. `artifact_type` is omitted because it never arrives:
+`runtime.js` forwards only `provider_id`, `model_id`,
+`required_capability`, `input`, and `max_retries` to an invoker, keeping
+the artifact type for itself. Fingerprinting an always-`undefined` field
+would compare nothing to nothing and quietly weaken the check.
+
+### Mutation testing found two real gaps
+
+Eighteen mutations across the fourteen named invariants. Two survived,
+and neither was redundant:
+
+**Provider selection binding.** Making phase 1 prefer `input.provider_id`
+killed no test — because `buildLiveScriptPrompt` happens to strip every
+field except `text`. Real defence, but the PROMPT BUILDER's property, not
+this boundary's; a future prompt passing more of the payload through
+would have handed provider selection to the payload. Tests 847 and 848
+now assert both properties independently.
+
+**Ticket theft.** Removing the caller binding killed no test, because
+every existing case involved a ticket phase 1 had already refused, so an
+earlier branch fired first. The binding matters in the case nothing
+covered: a GENUINELY ADMITTED ticket presented by a different agent. One
+live-capable invoker is handed to one runtime, and that runtime runs
+every stage's tasks — so without the check, another specialist naming the
+sentinel with the same prompt would consume the paid result and stamp its
+own provenance on the artifact. Theft of a paid call and a falsified
+lineage in one step. Test 849 covers it.
+
+After both fixes, all eighteen mutations are killed, and every mutated
+file was restored and confirmed byte-identical.
+
+### Live status
+
+**LIVE GROQ: GATED.** M27 established that this environment's egress
+policy denies `api.groq.com`, and M28 did not attempt to work around it.
+Every M28 test runs against an injected `fetchImpl` and reaches no
+network. What is proven is the complete provider-selection, governance,
+handoff, and artifact path — with a real HTTP response mocked at the
+adapter's own boundary, exactly where M25–M27 already mock it. No real
+Groq inference has been performed, and no money has been spent.
+
+### Success is still not permission
+
+Registering the live stage is not enough to spend anything: the M25
+configuration gates, live-guard, the resource governor, and the stage
+configuration must all agree. `registerContentFactoryAgents()` does not
+register it — an operator must opt in explicitly, the same way the
+adversarial rogue fixture has always worked. Connecting audio, image,
+video, publishing, or the CEO remains a separate milestone.
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

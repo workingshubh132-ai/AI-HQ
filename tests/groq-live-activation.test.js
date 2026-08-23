@@ -601,12 +601,31 @@ test('804. (M27) no CEO file can reach a credential, the network, the live regis
   }
 });
 
-test('805. (M27) the Content Factory remains deterministic — it references no live provider and no credential', () => {
+test('805. (M27, revised by M28) the Content Factory holds no credential, no network, and no provider registry — anywhere', () => {
+  // M27's version asserted the Content Factory referenced NOTHING live.
+  // M28 deliberately changed that: one designated stage now names a live
+  // SENTINEL. Rather than quietly relax the test to keep it green, it
+  // asserts the property that actually still has to hold — the Content
+  // Factory can name an intent, but it can never hold the means.
+  const CANNOT_HOLD_THE_MEANS = [
+    'GROQ', 'API_KEY', 'apiKey', 'Authorization', 'Bearer',       // credentials
+    'process.env', 'fetch(', 'axios', 'node:http', 'node:https',   // network
+    'createLiveProviderRegistry', 'createLiveProviderChain',        // provider wiring
+    'createGroqProvider', 'readGroqConfig', 'createResourceGovernor',
+    'configureGlobalBudget', 'configureAgentBudget', 'addFreeze(',  // budgets / Guardian
+  ];
   for (const path of ['../src/content-factory-agents.js', '../src/content-factory-orchestrator.js']) {
     const src = readFileSync(new URL(path, import.meta.url), 'utf8');
-    for (const term of ['GROQ', 'groq', 'API_KEY', 'process.env', 'fetch(', 'live-registry', 'live-guard']) {
+    for (const term of CANNOT_HOLD_THE_MEANS) {
       assert.ok(!src.includes(term), `${path} must not reference "${term}"`);
     }
+  }
+
+  // The ORCHESTRATOR stays entirely free of live wiring: deciding which
+  // stage runs must never be the same decision as which provider is used.
+  const orchestrator = readFileSync(new URL('../src/content-factory-orchestrator.js', import.meta.url), 'utf8');
+  for (const term of ['content-factory-live', 'LIVE_TEXT_CAPABILITY_ID', 'groq', 'live']) {
+    assert.ok(!orchestrator.includes(term), `the orchestrator must not reference "${term}"`);
   }
 });
 

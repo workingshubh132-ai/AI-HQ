@@ -212,3 +212,73 @@ synchronous in-memory store (D28); see DECISIONS.md D40 for exactly what
 was and was not proven against a real Postgres database. No new
 dependency, credential, network primitive, paid API call, or
 quota-bypass mechanism of any kind.
+
+---
+
+## One live stage (Milestone 28)
+
+Exactly ONE Content Factory stage can reach the real Groq boundary. The
+other eleven, the orchestrator, and the CEO are unchanged and entirely
+deterministic.
+
+```
+research (deterministic)
+    ↓
+idea (deterministic)
+    ↓
+cf-script-live-agent  ──►  capability admission
+                           live-guard (Guardian, lifecycle, approval)
+                           resource governor (budget, call ceiling)
+                           invoke-async (timeout, retries = 0)
+                           groq adapter  ──►  the one network egress
+    ↓
+SCRIPT artifact (provenance from trusted execution context)
+    ↓
+hook / audio / visual / subtitle / video / package  (all deterministic)
+```
+
+### It is opt-in, and off by default
+
+`registerContentFactoryAgents()` does **not** register the live stage —
+the same treatment the adversarial rogue fixture has always had. An
+operator calls `registerContentFactoryLiveScriptAgent(store)`
+explicitly. Even then, nothing is spent unless the M25 configuration
+gates, live-guard, the resource governor, and the stage configuration all
+agree.
+
+### The live stage has its own capability
+
+`cf-script-live`, deliberately distinct from `cf-script`. If the two
+shared a capability, the router would be free to send an ordinary
+deterministic run to the agent that spends real money.
+
+### A handler cannot choose a provider
+
+The live handler names a sentinel, `cf-live-text`, which is **not a
+registered provider**. Writing `provider_id: 'groq'` reaches nothing —
+no registry the Content Factory holds contains Groq. What the sentinel
+resolves to comes from operator configuration; the request's own
+`provider_id` and `model_id` are ignored.
+
+### Governance runs before the handler, not inside it
+
+`runtime.js` is synchronous and the live provider is not, so the network
+call happens in an async phase BEFORE the task runs. That phase performs
+every check and produces a sealed ticket. The handler then calls
+`generateContent()` exactly as every other stage does, and the ticket is
+honoured only if the caller is the admitted agent, the request matches
+what was approved, and the ticket has not already been used.
+
+Because runtime.js builds the artifact itself, provenance —
+`agent_id`, `version_id`, `registry_sha`, `workflow_id`, `task_id` —
+comes from the task record. A handler forging those fields changes
+nothing.
+
+### Failure fails closed
+
+A provider failure never falls back to the deterministic provider. A
+stage that quietly stops being live is a stage nobody can reason about,
+so the task fails instead.
+
+See DECISIONS.md D45 for the full rationale, the four new reason codes,
+and the two real gaps mutation testing found.

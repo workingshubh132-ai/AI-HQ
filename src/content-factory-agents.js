@@ -52,6 +52,7 @@
 
 import { makeAgent, makeAgentVersion, VERSION_STATE, RUNTIME_STATE, versionId } from './agents.js';
 import { ARTIFACT_TYPE } from './artifacts.js';
+import { LIVE_TEXT_CAPABILITY_ID } from './content-factory-live.js';
 
 export const WORKFLOW_TYPE_CONTENT_FACTORY = 'CONTENT_FACTORY';
 
@@ -60,6 +61,10 @@ export const CONTENT_FACTORY_CAPABILITY = Object.freeze({
   FACT_CHECK: 'cf-fact-check',
   IDEA: 'cf-idea',
   SCRIPT: 'cf-script',
+  /** M28: DISTINCT from SCRIPT on purpose. Sharing a capability with
+   * the deterministic script stage would leave the router free to send
+   * an ordinary run to the agent that spends money. */
+  SCRIPT_LIVE: 'cf-script-live',
   HOOK: 'cf-hook',
   AUDIO: 'cf-audio',
   VISUAL: 'cf-visual',
@@ -83,6 +88,9 @@ export const CONTENT_FACTORY_AGENT_SLUGS = Object.freeze({
   VIDEO_PLAN: 'cf-video-plan-agent',
   QUALITY_CONTROL: 'cf-quality-control-agent',
   PUBLISHING_PACKAGE: 'cf-publishing-package-agent',
+  /** M28: the ONE live-capable specialist. Registered only by an
+   * explicit opt-in call, never by registerContentFactoryAgents(). */
+  SCRIPT_LIVE: 'cf-script-live-agent',
   ROGUE: 'cf-rogue-agent',
 });
 
@@ -171,6 +179,63 @@ function scriptHandler({ input, generateContent }) {
   return {
     status: 'ok',
     result: { topic, script_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type, content_length: byteLengthOf(artifact.content) },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 4b. Script (M28: the ONE live-capable stage) ──────────────────────────
+
+/**
+ * The prompt, as a PURE function of the stage input.
+ *
+ * Both the pre-flight that governs and pays for the call and the handler
+ * that consumes the result derive the prompt from here, so the two agree
+ * by construction. If they ever disagreed, the request fingerprint would
+ * not match and the handler would be refused rather than handed content
+ * nobody authorised — see content-factory-live.js.
+ */
+export function buildLiveScriptPrompt({ topic, idea_artifact_id }) {
+  // The lineage parent is deliberately NOT in the prompt: it is
+  // provenance, recorded on the artifact by trusted code, and sending an
+  // internal identifier to a third party would leak structure for no
+  // benefit. It is accepted as an argument only to make that choice
+  // explicit rather than accidental.
+  void idea_artifact_id;
+  return {
+    text: `Write a short 3-scene video script about "${String(topic ?? 'untitled topic')}". `
+      + 'Keep it under 120 words. Plain text only.',
+  };
+}
+
+/**
+ * Identical in shape to `scriptHandler`, with ONE difference: it names
+ * the live sentinel instead of a deterministic provider.
+ *
+ * The sentinel is not a registered provider. It resolves to a real
+ * provider and model only through operator configuration, only for the
+ * one admitted agent, and only for the exact request already governed
+ * and paid for. If any of that fails this handler gets a refusal and
+ * throws — it never silently falls back to the deterministic provider,
+ * because a stage that quietly stops being live is a stage nobody can
+ * reason about.
+ */
+function scriptLiveHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const ideaParent = String(input.idea_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: LIVE_TEXT_CAPABILITY_ID,
+    model_id: input.model_id ?? null, // ignored downstream; the ticket's trusted model decides
+    input: buildLiveScriptPrompt({ topic, idea_artifact_id: ideaParent }),
+    artifact_type: ARTIFACT_TYPE.SCRIPT,
+    parent_artifact_ids: [ideaParent],
+    reason: 'cf-script-live-agent: script draft (live provider)',
+  }));
+  return {
+    status: 'ok',
+    result: {
+      topic, script_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type,
+      content_length: byteLengthOf(artifact.content), live: true,
+    },
     confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
   };
 }
@@ -523,6 +588,7 @@ function outputArtifactTypeFor(capability) {
     [CAP.FACT_CHECK]: [ARTIFACT_TYPE.TEXT],
     [CAP.IDEA]: [ARTIFACT_TYPE.TEXT],
     [CAP.SCRIPT]: [ARTIFACT_TYPE.SCRIPT],
+    [CAP.SCRIPT_LIVE]: [ARTIFACT_TYPE.SCRIPT],
     [CAP.HOOK]: [ARTIFACT_TYPE.TEXT],
     [CAP.AUDIO]: [ARTIFACT_TYPE.AUDIO],
     [CAP.VISUAL]: [ARTIFACT_TYPE.IMAGE],
@@ -596,6 +662,11 @@ export const CONTENT_FACTORY_AGENTS = Object.freeze({
     'Assembles the final CONTENT_PACKAGE artifact, referencing (never copying) every upstream artifact. Refuses to run if quality control did not pass.',
     publishingPackageHandler, { inputRequired: ['topic', 'stages', 'qc_passed'], outputRequired: ['content_package_artifact_id'] },
   ),
+  scriptLive: makeContentFactoryAgent(
+    S.SCRIPT_LIVE, 'agent-cf-script-live', CAP.SCRIPT_LIVE,
+    'M28: writes a SCRIPT artifact through the governed LIVE provider boundary. Registered only on explicit opt-in.',
+    scriptLiveHandler, { inputRequired: ['topic', 'idea_artifact_id'], outputRequired: ['script_artifact_id'] },
+  ),
   rogue: makeContentFactoryAgent(
     S.ROGUE, 'agent-cf-rogue', CAP.RESEARCH,
     'Adversarial fixture: forges identity fields in a generateContent request and emits authorization-shaped output. Never registered by default.',
@@ -614,6 +685,23 @@ export function registerContentFactoryAgents(store) {
     store.addAgentVersion(version);
     store.registerAgent(record);
   }
+}
+
+/**
+ * M28: registers ONLY the live-capable script specialist.
+ *
+ * Deliberately NOT part of registerContentFactoryAgents(): a Content
+ * Factory that nobody explicitly opted in stays entirely deterministic,
+ * and no run can become live by accident. Registering this agent is
+ * still not sufficient to spend anything — the M25 configuration gates,
+ * live-guard, the resource governor, and the stage configuration all
+ * have to agree as well.
+ */
+export function registerContentFactoryLiveScriptAgent(store) {
+  const { version, record } = CONTENT_FACTORY_AGENTS.scriptLive;
+  store.addAgentVersion(version);
+  store.registerAgent(record);
+  return record.slug;
 }
 
 /** Registers ONLY the adversarial fixture. */

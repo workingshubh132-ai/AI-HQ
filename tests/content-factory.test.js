@@ -124,10 +124,28 @@ test('560. all twelve content-factory agents are registered as real, approved, a
 test('561. each content-factory agent has a distinct, single declared capability — clear, non-overlapping responsibility', () => {
   const { store } = fullStack();
   registerContentFactoryAgents(store);
+
+  // Two agents are OPT-IN ONLY and must not be registered by default:
+  // the adversarial rogue fixture, and M28's live-capable script stage.
+  // Asserted, not silently filtered — "the money-spending agent is absent
+  // unless someone explicitly asked for it" is the invariant that keeps
+  // an ordinary Content Factory run deterministic.
+  for (const optIn of [S.ROGUE, S.SCRIPT_LIVE]) {
+    assert.equal(store.getAgent(optIn), null, `${optIn} must not be registered by default`);
+  }
+
   const caps = Object.values(CONTENT_FACTORY_AGENTS)
-    .filter((a) => a.record.slug !== S.ROGUE)
+    .filter((a) => a.record.slug !== S.ROGUE && a.record.slug !== S.SCRIPT_LIVE)
     .map((a) => store.getAgent(a.record.slug).capabilities[0]);
   assert.equal(new Set(caps).size, caps.length, 'no two legitimate agents share a capability');
+
+  // And the live stage's capability is distinct from the deterministic
+  // script stage's. If they shared one, the router would be free to send
+  // an ordinary run to the agent that spends real money.
+  const live = CONTENT_FACTORY_AGENTS.scriptLive.version.capabilities[0];
+  const deterministic = CONTENT_FACTORY_AGENTS.script.version.capabilities[0];
+  assert.notEqual(live, deterministic, 'the live stage must not share the deterministic stage\'s capability');
+  assert.equal(caps.includes(live), false, 'and no registered agent may declare it');
 });
 
 test('562. every content-factory agent version has resource limits within validator.js\'s own POLICY ceilings', async () => {
