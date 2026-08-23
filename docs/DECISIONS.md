@@ -2501,6 +2501,143 @@ of any kind.
 
 ---
 
+## D41 — The CEO: an orchestrator with the least authority in the system
+
+Decided 2026-08-23 (Milestone 24).
+
+`src/ceo-agent.js` (the CEO as DATA) and `src/ceo/` (limits, planner,
+recovery, completion, orchestrator) turn a high-level goal into governed
+work. **This milestone modified zero existing files.** Every core
+governance file — `broker.js`, `router.js`, `workflow.js`, `runtime.js`,
+`guardian.js`, `approval-engine.js`, `execution-coordinator.js`,
+`validator.js` — is byte-for-byte untouched, and contains no CEO-shaped
+branch of any kind (test 682 greps for one directly). The CEO is
+invisible to the machinery that governs it, which is the point.
+
+**Why the CEO is an orchestration component under a governed identity,
+rather than a task handler.** A handler receives exactly `{input,
+callTool, callModel, createArtifact, generateContent, DECISION}`
+(runtime.js, unchanged since M22). It holds no coordinator, no router,
+no workflow engine — deliberately, because a handler that could propose
+arbitrary tasks would be a general-purpose bypass of the admission
+gauntlet every task must pass. Widening that closure set for the CEO
+would have been precisely the "CEO requires special authorization" STOP
+condition the M24 directive names, so it was not done. The CEO is
+instead a component that acts UNDER a registered agent identity — the
+same shape `content-factory-orchestrator.js` (M23) already has.
+
+**What makes that governed rather than a loophole: the CEO is subject to
+the machinery it orchestrates.** `ceoGovernanceCheck()` re-reads the
+CEO's OWN agent record from the real store before every decision cycle —
+never cached — and halts on an unregistered CEO, an unapproved version,
+a non-active lifecycle, or any agent/workflow/global freeze covering it.
+A frozen CEO orchestrates nothing (tests 653-657, 675); a freeze imposed
+mid-run stops the very next stage while every already-created artifact
+survives untouched (test 657). This is the direction that actually
+matters: not merely that the CEO cannot grant itself authority, but that
+Guardian can stop the CEO exactly as it can stop any specialist.
+
+**The CEO holds the weakest credentials in the system.** `clearance:
+'GREEN'`, `allowed_tools: []` — the least authority any agent here can
+hold. The Broker independently confirms it: a direct `broker.execute()`
+for the CEO is DENY (test 616). Three structural guarantees back this up
+rather than relying on grep alone:
+
+  1. **A read-only store facade.** `readOnlyStore()` wraps the real
+     store and exposes only `getAgent`/`listAgents`/`getTask`/
+     `activeFreeze`/`budgetsFor`. The CEO's logic holds the facade, never
+     the store, so `setLifecycleState`, `addFreeze`, `chargeBudgets`,
+     `addBudget`, and `registerAgent` are absent from the object it
+     actually has (tests 679-680).
+  2. **`requestApproval` is a bare FUNCTION, never the Approval
+     Engine.** The CEO can ask for an approval; `decide()` and
+     `revoke()` are not properties of anything it holds (tests 658-659).
+     A human decides, always.
+  3. **`RECOVERY_ACTION` has no bypass in its vocabulary.** The recovery
+     policy can only return "ask the existing machinery again,
+     differently" or "stop." There is no `UNFREEZE`, `OVERRIDE`,
+     `FORCE`, or `SELF_APPROVE` action to return (tests 644, 647) — a
+     stronger guarantee than a rule saying not to use one.
+
+**Plan templates are DATA with declarative input bindings — not a second
+pipeline.** The M24 directive forbids duplicating existing
+responsibilities, and M23's `runContentFactory` already hardcodes a
+twelve-stage sequence. Rather than write a second executor, the
+CONTENT_FACTORY pipeline is expressed as a `CONTENT_FACTORY_PLAN_TEMPLATE`:
+each stage declares a `required_capability`, `depends_on`, an
+`expected_artifact_type`, and an `input_binding` that says
+declaratively where each input field comes from — the goal, an upstream
+stage's REAL completed output, or a summary built from real completed
+stages. `resolveStageInput()` resolves those bindings against actual
+task records; an unresolvable binding is a structured failure, never a
+default (test 635). Adding a pipeline becomes adding a template, the
+same way `actions.js`'s ACTIONS and `artifacts.js`'s ARTIFACT_TYPE have
+each grown. Execution still goes through `coordinator.proposeTask()` then
+`runtime.runTask()` — the identical two calls in the identical order M23
+makes, for the reason D40 documents.
+
+**No plan ever names an agent_slug.** Every stage names a capability;
+`router.js` picks the specialist, fresh, at proposal time. `planner.js`
+is checked directly for the absence of every content-factory slug (test
+625). When a required capability has no eligible specialist, the result
+is a structured `CAPABILITY_UNAVAILABLE` naming exactly what is missing
+— never a substitution of "something close" (tests 624, 672).
+
+**Goal parsing is deterministic string work, and is labelled as such
+everywhere.** `parseGoal()` is a regex/keyword classifier: literal
+keywords select a template, `about X`/`on X` lifts a topic. Same goal,
+same plan, forever — no model call, no inference, no randomness. A goal
+it cannot parse yields `MALFORMED_GOAL` or `NO_TEMPLATE_FOR_GOAL`, never
+a guess (tests 622-623). Completion evaluation is the same kind of
+thing: `evaluateCompletion()` compares real task statuses, real artifact
+types, and a real boolean QC result against the plan's declared criteria,
+and reports `check_type: 'DETERMINISTIC_STRUCTURAL_CHECK'` — the same
+honest label M23's own quality-control agent carries. A package whose
+script is nonsense passes every check, and the report says so in its own
+`limitations` field. Neither is described as comprehension anywhere.
+
+**Every loop is bounded, with one aggregate backstop.**
+`MAX_PLANNING_ITERATIONS`, `MAX_RECOVERY_ATTEMPTS_PER_STAGE`, and
+`MAX_REPLAN_CYCLES` each bound one kind of repetition;
+`MAX_CEO_DECISIONS_PER_WORKFLOW` (64) is the single aggregate ceiling
+over every CEO decision of every kind, so no combination of the others
+can compose into an unbounded run. The counter is frozen and cannot be
+raised at runtime by anything the CEO reads (test 650). A permanently
+failing stage really is abandoned within the ceiling rather than retried
+forever (tests 651, 674); a full successful run spends 13 of 64.
+
+**A real gap found by mutation testing, investigated rather than
+dismissed.** Disabling the orchestrator's `proposal.decision !==
+'accepted'` check initially produced ZERO failing tests. Investigation
+showed why this was not an equivalent mutation: with the check gone, the
+CEO calls `runtime.runTask()` for a stage the workflow engine explicitly
+REFUSED to admit — and `runtime.js` creates a task record for any
+task_id it is handed, materialising a task outside the workflow's own
+`task_ids`. The run still halted, but for a misleading reason
+(`UNKNOWN_AGENT`, since a rejection carries no selected agent) and only
+after bypassing admission. The existing tests missed it because they
+asserted only on the final halt state. Fixed by strengthening tests 669
+and 670 to assert the reported failure is the ROUTING reason and that a
+refused proposal leaves NO task record behind. Re-run: caught. All 15
+mutations now caught.
+
+**What this milestone deliberately does not do.** No live/network
+provider (Groq, Claude, OpenAI, Gemini) — the CEO is provider-independent
+and never names a provider at all; swapping the deterministic providers
+for a real one is a provider-layer change that requires no CEO
+governance change. No new dependency (`package.json` and
+`package-lock.json` are untouched). No persistence redesign — the CEO
+adds no storage primitive, reads through the existing contract, and
+writes nothing but audit events; its execution path runs against the
+synchronous in-memory store exactly like every prior live path (D28). No
+replanning implementation yet — `MAX_REPLAN_CYCLES` is enforced as a
+frozen ceiling, but the planner is single-pass today, so the limit is
+headroom enforced before a loop exists rather than after. No credential,
+network primitive, shell primitive, paid API call, or quota-bypass
+mechanism of any kind.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.
