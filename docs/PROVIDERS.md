@@ -538,10 +538,14 @@ question before real money moves: **is the operator-facing activation
 itself safe** — the ceiling they configure, the model they name, the
 call budget they are promised?
 
-> **Live status in this repository: LIVE GROQ TEST NOT RUN.** No
-> `GROQ_API_KEY`, `GROQ_MODELS`, or `GROQ_MAX_SPEND_USD` was present in
-> this environment, so the run stopped cleanly before any network access
-> and **no money was spent**. Nothing was fabricated or substituted.
+> **Live status: RAN with a real credential — BLOCKED BY NETWORK POLICY,
+> not by AI-HQ.** An operator supplied a real `GROQ_API_KEY`. Every
+> governance hop executed: the configuration gate opened, exactly one
+> model was selected, the Guardian/lifecycle gate passed, the resource
+> governor reserved and settled, and **exactly one** network request was
+> attempted. That request never reached Groq — this environment's egress
+> proxy answered `403 Host not in allowlist: api.groq.com` — so **no
+> inference happened and no money was spent**. See §3b.8.
 
 Asking the question found three real defects.
 
@@ -654,6 +658,51 @@ nothing. The CEO still cannot enable Groq, read the credential, or change
 a budget or limit; the Content Factory remains deterministic; and Groq is
 still absent from the default registry. Connecting either is a separate
 milestone, separately reviewed.
+
+### 3b.8 The first real-credential run: everything held, egress was blocked
+
+An operator supplied a real key. The run is the first end-to-end
+execution of the whole chain with a live credential rather than a
+sentinel, and every hop behaved:
+
+| Hop | Observed |
+| --- | --- |
+| Configuration gate | opened — real key, exactly one model, `0.05` USD ceiling |
+| Model selection | exactly one, taken as configured |
+| Guardian / `live-guard.js` | **PASS** |
+| Resource governor | reserved, then settled |
+| Network requests | **1** — the call budget was met exactly |
+| Retries | none |
+| Classification | `PROVIDER_AUTH_FAILED` |
+| Credential containment | real key absent from output, result envelope, and audit log |
+
+The request was refused by this environment's egress proxy with
+`403 Host not in allowlist: api.groq.com` and never reached Groq. **No
+inference occurred and nothing was billed.** The blocker is the
+environment's network policy, chosen when the environment was created —
+not AI-HQ, and not the credential. Adding `api.groq.com` to the
+environment's allowed egress hosts is what unblocks a real activation;
+see https://code.claude.com/docs/en/claude-code-on-the-web.
+
+**Known limitation this surfaced: a 403 from an intermediary is
+indistinguishable from a 403 from the provider.** `classifyHttpStatus`
+maps both to `PROVIDER_AUTH_FAILED`, so an operator reading only the
+reason code would go and rotate a perfectly good key.
+
+This was deliberately **not** "fixed" with a heuristic. The only
+available signal is the error body's wording, which varies by proxy, and
+the two possible mistakes are not symmetric: classifying a network block
+as an auth failure is merely imprecise and still fails closed
+(non-retryable, no quota burned), whereas classifying a genuine
+credential rejection as a network problem would tell an operator to
+ignore a rejected key. The conservative mapping is kept, and the `detail`
+field carries the true cause verbatim — in this run,
+`HTTP 403: Host not in allowlist: api.groq.com`, which is exactly what an
+operator needs to see.
+
+**Still unverified:** Groq's own HTTP behavior, real latency, real token
+accounting, and whether the supplied credential is accepted. Those need
+an environment whose egress policy permits `api.groq.com`.
 
 ## 4. Future image provider
 

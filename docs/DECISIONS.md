@@ -3080,19 +3080,49 @@ considered hostile.
 
 ### What was actually run
 
-**No live Groq call was made and no money was spent.** No
-`GROQ_API_KEY`, `GROQ_MODELS`, or `GROQ_MAX_SPEND_USD` was present in
-this environment. Per the milestone's own rules 7–9 that is a clean stop
-before network access, not a failure — and no credential was fabricated,
-borrowed from another provider, or substituted.
+Two phases. First, with no credential present, every refusal path was
+verified end to end through the real script
+(`REAL_PROVIDER_NOT_ENABLED`, `INVALID_SPEND_CEILING`,
+`AMBIGUOUS_MODEL_SELECTION`), plus the full live path against a **closed
+local port** with a sentinel key — gate passed, governor reserved and
+settled, exactly one network call attempted, classified
+`PROVIDER_UNAVAILABLE`.
 
-Everything reachable without a credential was verified: every refusal
-path end to end through the real script (`REAL_PROVIDER_NOT_ENABLED`,
-`INVALID_SPEND_CEILING`, `AMBIGUOUS_MODEL_SELECTION`), and the full live
-path against a **closed local port** with a sentinel key — gate passed,
-governor reserved and settled, exactly one network call attempted,
-classified `PROVIDER_UNAVAILABLE`, exit 1. Every hop ran; nothing left
-the machine.
+Then an operator supplied a real `GROQ_API_KEY`, and the chain ran with a
+live credential for the first time. **Every governance hop held:** the
+configuration gate opened, exactly one model was selected, the
+Guardian/lifecycle gate passed, the governor reserved and settled,
+**exactly one** network request was attempted, and no retry occurred. The
+real key was confirmed absent from the script output, the result
+envelope, and the audit log.
+
+**The request never reached Groq.** This environment's egress proxy
+answered `403 Host not in allowlist: api.groq.com`. **No inference
+happened and no money was spent.** The blocker is the environment's
+network policy, not AI-HQ and not the credential — which is itself a
+useful result: the system's own boundaries were never what stopped it.
+
+### A 403 from an intermediary looks exactly like a 403 from the provider
+
+That run classified an egress-policy denial as `PROVIDER_AUTH_FAILED`,
+because `classifyHttpStatus` maps every 403 that way. An operator reading
+only the reason code would go rotate a perfectly good key.
+
+This was deliberately not patched with a heuristic. The only signal
+available is the error body's wording, which varies by proxy and vendor,
+and the two possible mistakes are not symmetric. Calling a network block
+an auth failure is imprecise but still fails closed — non-retryable, no
+quota burned. Calling a genuine credential rejection a network problem
+would tell an operator to ignore a rejected key, and would invite making
+it retryable, which is exactly what M25 refused to do for auth failures.
+Between an imprecise-but-safe mapping and a precise-but-fragile one, the
+safe mapping wins; the `detail` field already carries the true cause
+verbatim, and that is what an operator actually reads.
+
+**Still unverified, and stated as such:** Groq's own HTTP behavior, real
+latency, real token accounting, and whether the supplied credential is
+accepted. Those require an environment whose egress policy permits
+`api.groq.com`.
 
 ### Mutation testing
 
