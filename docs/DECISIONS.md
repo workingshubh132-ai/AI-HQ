@@ -2959,6 +2959,158 @@ Guardian, approve its own YELLOW actions, choose a provider or model, or
 authorize spending. Live activation remains an operator act performed
 through the environment.
 
+## D44 — A ceiling of zero meant unlimited, and rules that live in scripts cannot be tested
+
+Decided 2026-08-23 (Milestone 27).
+
+M27 was meant to be a single operator-supplied live Groq call. The
+credential never arrived, so that call did not happen — but preparing for
+it found three real defects in the operator-facing path, and then
+mutation testing found a fourth problem with how two of the fixes were
+written.
+
+**No protected file was modified.** `broker.js`, `validator.js`,
+`runtime.js`, `workflow.js`, `router.js`, `guardian.js`,
+`approval-engine.js`, `execution-coordinator.js`, `resource-governor.js`,
+`ceo-agent.js`, and `src/ceo/` are byte-identical to the milestone's
+start commit, as are both Content Factory files and
+`providers/default-registry.js`.
+
+### Finding 1: `GROQ_MAX_SPEND_USD=0` disabled every budget in the system
+
+`parseSpendCeiling` accepted any finite value `>= 0`. A ceiling of zero
+therefore opened the configuration gate and gave the model a
+`max_cost_per_call` of **0** — which makes the governor's reservation
+test, `spent + reserved + 0 > limit`, false forever. Every budget at
+every scope became structurally unenforceable.
+
+This was measured, not reasoned about: with the ceiling set to `0` and a
+global budget of `0.01` USD, **25 of 25 calls reached the network.**
+
+The inversion is what makes it serious. Of every value an operator might
+type, `0` is the one that most clearly means "spend nothing," and it was
+the only one that removed all spending limits. It is also the same
+failure mode M25 documented for an `undefined` ceiling (`NaN > limit` is
+always false) — the fix landed one value short.
+
+Ceilings must now be finite and **strictly positive**. An operator who
+wants to spend nothing turns the provider off; a zero ceiling is a
+configuration mistake and fails closed like one. Test 701 was
+strengthened rather than weakened: it previously asserted
+`parseSpendCeiling('0') === 0`, which encoded the defect.
+
+### Finding 2: the activation script silently substituted a model
+
+With `GROQ_MODELS=a,b` the smoke script took `models[0]`, charged model
+`a`, and said nothing. The M27 directive required the operator-selected
+model to be used "exactly as configured," and a silent narrowing on the
+one variable that decides what money buys is a substitution. A controlled
+activation now requires exactly one model and refuses
+`AMBIGUOUS_MODEL_SELECTION` otherwise.
+
+### Finding 3: the exactly-one-call check ran only on the success path
+
+It sat after the failure branch had already called `process.exit(1)`. So
+the single case where the check matters most — a **failed** run that
+retried, meaning money left more than once — was precisely the case it
+could not report.
+
+It now runs on every path, before any exit, and compares two independent
+counters: `networkCalls` (what the wire saw, which is what corresponds to
+money) and `attempts` (what the governed invoker believes it did). Both
+must be one. A *disagreement* between them is its own violation rather
+than something to reconcile, because it means a request happened outside
+the governed path. An uncounted run also fails closed: a missing counter
+must never read as "zero calls," since invisible spending is worse than
+known overspending.
+
+### Finding 4: two of those fixes were untestable, and mutation testing proved it
+
+Findings 2 and 3 were first written inline in
+`scripts/live-groq-smoke.mjs`. Mutation testing then disabled each with
+`if (false && ...)` and **nothing failed.**
+
+The reason is structural. A script that runs `main()` on import cannot be
+imported by a test, so the only assertions available were on its SOURCE
+TEXT — that the right strings appeared, in the right order. Those
+assertions all still passed against a block that no longer ran. A test
+that checks where code is written rather than what it does cannot
+distinguish working code from disabled code.
+
+Both rules therefore moved into real modules: `selectSingleModel` in
+`groq-config.js`, and `verifyCallBudget` / `enforceCallBudget` in the new
+`live-call-budget.js`. The script now holds no branch of its own — it
+calls a function that both decides and refuses, with `report` and `fail`
+injected so "does a violation actually stop the run?" is a question a
+test can ask directly.
+
+This is M26's own lesson one level up. M26 found a guard that was correct
+but unreachable and made it reachable; M27 found rules that were correct
+but unobservable and made them observable. **An invariant worth having is
+an invariant worth putting somewhere a test can reach.**
+
+### Finding 5: an M26 mutation had been killed for the wrong reason
+
+Re-running the model-allowlist mutation with a differently-named model
+revealed that M26's equivalent kill was incidental. Test 704 greps
+`groq.js` for hardcoded substrings — `llama`, `mixtral`, `gemma` — so
+M26's injected `llama-not-allowlisted-99b` tripped a *hardcoded-name*
+check, not an allowlist check. Injecting `unlisted-model-99b` instead
+sailed through every test in the suite.
+
+The real invariant — **the registry exposes exactly the configured
+allowlist, no more and no fewer** — had never been asserted anywhere.
+Test 800c asserts it directly now. A mutation that dies is not proof the
+right test caught it.
+
+### Finding 6: a provider echoing the credential got it into the audit log
+
+`invoke-async.js` writes the provider's `output` into the
+`provider.invocation` audit record, and `redact()` was applied only to
+error text. An upstream that reflected the `Authorization` header into
+its **completion** — a hostile proxy, a debug echo, a compromised
+gateway — therefore wrote a live credential into an append-only,
+permanent log, and into any artifact built from that output.
+
+Fixed at the credential boundary, in `groq.js`, where the key is in
+scope: the completion text is redacted exactly as error text always was.
+Fixing it there fixes it once for every consumer — nothing downstream can
+leak what it never receives. The success path had simply never been
+considered hostile.
+
+### What was actually run
+
+**No live Groq call was made and no money was spent.** No
+`GROQ_API_KEY`, `GROQ_MODELS`, or `GROQ_MAX_SPEND_USD` was present in
+this environment. Per the milestone's own rules 7–9 that is a clean stop
+before network access, not a failure — and no credential was fabricated,
+borrowed from another provider, or substituted.
+
+Everything reachable without a credential was verified: every refusal
+path end to end through the real script (`REAL_PROVIDER_NOT_ENABLED`,
+`INVALID_SPEND_CEILING`, `AMBIGUOUS_MODEL_SELECTION`), and the full live
+path against a **closed local port** with a sentinel key — gate passed,
+governor reserved and settled, exactly one network call attempted,
+classified `PROVIDER_UNAVAILABLE`, exit 1. Every hop ran; nothing left
+the machine.
+
+### Mutation testing
+
+Twenty mutations across the twelve controls M27 names. Three survived on
+the first pass and none was dismissed: two were the untestable-script
+problem of finding 4, and one was the mis-attributed kill of finding 5.
+After the fixes, **all twenty are killed**. Every mutated file was
+restored and confirmed byte-identical by SHA-256.
+
+### Success is not permission
+
+A successful activation would prove that the controlled provider path
+works. It would not enable Groq anywhere. Configuration is re-read on
+every call, so a prior success never becomes standing authorization —
+test 807 withdraws authorization between two calls and asserts the second
+sends nothing. Connecting Groq to the CEO or the Content Factory remains
+a separate milestone, separately reviewed.
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

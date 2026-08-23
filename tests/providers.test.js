@@ -582,8 +582,8 @@ test('513. structural: every file exported from src/providers/ is actually reach
     // UNEXPECTED file appearing here — so a genuinely new, reviewed file
     // updates the list rather than loosening the assertion.
     'groq-config.js', 'groq.js', 'invoke-async.js', 'invoke.js',
-    // M26 added the live Guardian/lifecycle gate.
-    'live-guard.js', 'live-registry.js', 'registry.js',
+    // M26 added the live Guardian/lifecycle gate; M27 the live call budget.
+    'live-call-budget.js', 'live-guard.js', 'live-registry.js', 'registry.js',
   ]);
 });
 

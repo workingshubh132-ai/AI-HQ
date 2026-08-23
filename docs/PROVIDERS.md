@@ -531,6 +531,130 @@ The resource governor's accounting units are `JSON.stringify(...).length`,
 reported as `UNPRICED_REAL_SPEND` — never `$0.00`, and never a fabricated
 price. AI-HQ does not know Groq's pricing and does not guess it.
 
+## 3b. Operator-supplied activation (Milestone 27)
+
+M26 proved the governed live path fails closed. M27 asks the last
+question before real money moves: **is the operator-facing activation
+itself safe** — the ceiling they configure, the model they name, the
+call budget they are promised?
+
+> **Live status in this repository: LIVE GROQ TEST NOT RUN.** No
+> `GROQ_API_KEY`, `GROQ_MODELS`, or `GROQ_MAX_SPEND_USD` was present in
+> this environment, so the run stopped cleanly before any network access
+> and **no money was spent**. Nothing was fabricated or substituted.
+
+Asking the question found three real defects.
+
+### 3b.1 `GROQ_MAX_SPEND_USD=0` opened the gate and disabled every budget
+
+A ceiling of zero reads to an operator as "spend nothing." It produced a
+per-call reservation of **0**, which makes the governor's arithmetic —
+`spent + reserved + 0 > limit` — false forever. Every budget at every
+scope became structurally unenforceable.
+
+Measured, not theorized: **25 of 25 real calls reached the network under
+a 0.01 USD global budget.** The control was inverted — the value that
+looks most restrictive was the only one that removed all restriction.
+
+This is the same failure mode M25 documented for an *undefined* ceiling
+(`NaN > limit` is always false) and fixed one value short of. The ceiling
+is now required to be finite and **strictly positive**; zero and `-0`
+fail closed like any other invalid value. An operator who wants to spend
+nothing unsets `AI_HQ_REAL_PROVIDER_ENABLED` or sets
+`GROQ_ENABLED=false` — a ceiling of zero is a configuration mistake, and
+is now treated as one.
+
+### 3b.2 The smoke script silently took `models[0]`
+
+With `GROQ_MODELS=a,b` the run charged model `a` and said nothing about
+the choice. On the single variable that decides what an operator's money
+is spent on, a silent narrowing is a substitution. A controlled
+activation now requires **exactly one** model and refuses
+`AMBIGUOUS_MODEL_SELECTION` otherwise.
+
+### 3b.3 The one-call check only ran when the call succeeded
+
+A failed run that retried is the case where money leaves more than once —
+and it was the one case the check could not see, because it sat after the
+failure branch had already exited. The verification now runs on **every**
+path, before any exit, and compares two independent counters:
+
+| Counter | Source | Meaning |
+| --- | --- | --- |
+| `networkCalls` | a wrapper around `fetch` | what the wire saw — this is the number that corresponds to money |
+| `attempts` | the governed invoker | what the system believes it did |
+
+Both must be exactly one. If they *disagree*, that is reported as its own
+violation rather than reconciled: a disagreement means a request happened
+outside the governed path. An **uncounted** run also fails closed — a
+missing counter never reads as "zero calls," because invisible spending
+is worse than known overspending.
+
+### 3b.4 Rules that live in scripts cannot be tested
+
+Two of the three fixes above were first written inline in
+`scripts/live-groq-smoke.mjs`. Mutation testing then disabled each of
+them — `if (false && ...)` — and **nothing failed**. The only tests
+covering them asserted on the script's *source text*: that the right
+strings appeared, in the right order. A source-text test cannot tell a
+working rule from a disabled one.
+
+So both rules moved into real modules — `selectSingleModel` in
+`groq-config.js` and `verifyCallBudget` / `enforceCallBudget` in
+`live-call-budget.js` — where their behavior is verifiable. The script now
+holds no branch of its own: it calls a function that both decides and
+refuses. This is M26's own lesson (an invariant worth having is an
+invariant worth making reachable by a test) applied one level up.
+
+### 3b.5 Running an activation
+
+```bash
+AI_HQ_REAL_PROVIDER_ENABLED=true \
+GROQ_ENABLED=true \
+GROQ_API_KEY=<your key> \
+GROQ_MODELS=<exactly one model you have verified> \
+GROQ_MAX_SPEND_USD=0.05 \
+  npm run smoke:groq
+```
+
+Exit `0` = one real call succeeded; `1` = ran and failed, or a budget
+violation or credential leak was detected; `2` = **NOT RUN**, refused
+before any network access.
+
+Refusal reasons an operator will actually meet:
+
+| Configuration | Reason | Network calls |
+| --- | --- | --- |
+| Anything missing | `REAL_PROVIDER_NOT_ENABLED` / `NO_CREDENTIAL` / `NO_MODELS_CONFIGURED` | 0 |
+| `GROQ_MAX_SPEND_USD` of `0`, `-0`, negative, malformed, or absent | `INVALID_SPEND_CEILING` | 0 |
+| `GROQ_MODELS` naming more than one model | `AMBIGUOUS_MODEL_SELECTION` | 0 |
+| Any Guardian freeze or unhealthy agent | denied at `live-guard.js` | 0 |
+| Any budget scope insufficient | `*_MODEL_BUDGET_EXCEEDED` | 0 |
+
+### 3b.6 A credential echoed back by the provider
+
+M27 also closed a narrower leak. `invoke-async.js` writes the provider's
+`output` into the `provider.invocation` audit record, and `redact()` was
+applied only to *error* text. An upstream that reflected the
+`Authorization` header into its **completion** — a hostile proxy, a debug
+echo, a compromised gateway — therefore wrote a live credential into an
+append-only, permanent log, and into any artifact built from that output.
+
+The completion is now redacted at the credential boundary, in `groq.js`,
+where the key is in scope. Fixing it there fixes it once for every
+consumer: nothing downstream can leak what it never receives.
+
+### 3b.7 Success is not permission
+
+A successful activation proves *the controlled provider path works*. It
+does **not** enable Groq anywhere. Configuration is re-read on every
+call, so a prior success never becomes standing authorization — test 807
+takes authorization away between two calls and asserts the second sends
+nothing. The CEO still cannot enable Groq, read the credential, or change
+a budget or limit; the Content Factory remains deterministic; and Groq is
+still absent from the default registry. Connecting either is a separate
+milestone, separately reviewed.
+
 ## 4. Future image provider
 
 Same pattern as Groq: a new file under `src/providers/`, `provider_type:

@@ -45,9 +45,10 @@ import { ARTIFACT_TYPE } from '../src/artifacts.js';
 import { createLiveProviderRegistry } from '../src/providers/live-registry.js';
 import { createAsyncProviderInvoker } from '../src/providers/invoke-async.js';
 import { buildArtifactRequestFromProviderResult } from '../src/providers/artifact-bridge.js';
-import { readGroqConfig, GROQ_ENV } from '../src/providers/groq-config.js';
+import { readGroqConfig, GROQ_ENV, selectSingleModel } from '../src/providers/groq-config.js';
 import { GROQ_PROVIDER_ID } from '../src/providers/groq.js';
 import { createLiveProviderChain } from '../src/providers/live-guard.js';
+import { enforceCallBudget } from '../src/providers/live-call-budget.js';
 
 /** Tiny, deterministic, non-sensitive. The point is connectivity and
  * governance, not generation quality. */
@@ -90,7 +91,12 @@ async function main() {
     notRun(config.reason, 'Every M25 configuration gate must hold before one real call is made.');
   }
 
-  const model = config.models[0];
+  // EXACTLY one model, never `models[0]`. The rule itself lives in
+  // groq-config.js so it is testable behavior rather than a line of
+  // script text — see `selectSingleModel`.
+  const selected = selectSingleModel(config.models);
+  if (!selected.ok) notRun(selected.reason, selected.detail);
+  const model = selected.model;
   const spendCeiling = config.max_spend_usd;
 
   // Safe banner ONLY. No key, no headers, no env dump.
@@ -193,6 +199,22 @@ async function main() {
   line(`  Elapsed:                 ${elapsedMs}ms`);
   line(`  Governance:              reservation + settlement completed`);
 
+  // ── exactly-one-call guarantee, checked on EVERY path ───────────────
+  // Deliberately BEFORE the success/failure branch. A failed call that
+  // somehow retried is the single most important thing this script can
+  // tell an operator — it means real money went out more than once — and
+  // reporting it only on the success path would hide exactly the case
+  // that matters most. `attempts` is the governed invoker's own count;
+  // `networkCalls` is what the wire actually saw. Both must be one.
+  // No branch of its own: the module decides AND refuses. See
+  // live-call-budget.js for why the `if` had to leave this file.
+  enforceCallBudget({
+    networkCalls,
+    attempts: result.attempts ?? null,
+    report: line,
+    fail: () => process.exit(1),
+  });
+
   if (result.status !== 'ok') {
     // A sanitized detail only — the adapter has already redacted the
     // credential out of any provider error text.
@@ -200,14 +222,7 @@ async function main() {
     line();
     line('  LIVE GROQ TEST: RAN — FAILED');
     line(`  Classified as: ${result.reason}`);
-    line();
-    process.exit(1);
-  }
-
-  // ── exactly-one-call guarantee ──────────────────────────────────────
-  if (networkCalls !== 1) {
-    line();
-    line(`  ✗ EXPECTED EXACTLY ONE NETWORK REQUEST, OBSERVED ${networkCalls}`);
+    line(`  Live requests made: ${networkCalls} (within budget)`);
     line();
     process.exit(1);
   }

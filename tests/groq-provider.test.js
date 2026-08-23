@@ -156,8 +156,8 @@ test('687. (A) src/providers/ contains exactly the expected files — no stray p
     'artifact-bridge.js', 'contracts.js', 'default-registry.js',
     'deterministic-audio.js', 'deterministic-image.js', 'deterministic-subtitle.js',
     'deterministic-text.js', 'deterministic-video.js',
-    'groq-config.js', 'groq.js', 'invoke-async.js', 'invoke.js', 'live-guard.js',
-    'live-registry.js', 'registry.js',
+    'groq-config.js', 'groq.js', 'invoke-async.js', 'invoke.js',
+    'live-call-budget.js', 'live-guard.js', 'live-registry.js', 'registry.js',
   ]);
 });
 
@@ -328,17 +328,25 @@ test('700b. (E) a disabled provider is refused by the invoke pipeline itself, be
 
 // ══ ZERO-SPEND SAFETY: the ceiling never means "unlimited" ════════════════
 
-test('701. the spending ceiling fails closed for every non-number — undefined, null, empty, NaN, Infinity, negative', () => {
+test('701. the spending ceiling fails closed for every non-number — undefined, null, empty, NaN, Infinity, negative, and ZERO', () => {
   for (const bad of [undefined, null, '', '   ', 'NaN', 'nan', 'Infinity', '-Infinity', 'infinity', '-1', '-0.01', 'abc', {}, []]) {
     assert.equal(parseSpendCeiling(bad), null, 'a non-number ceiling must never be accepted');
   }
   for (const bad of [NaN, Infinity, -Infinity, -1]) {
     assert.equal(parseSpendCeiling(bad), null);
   }
-  // Only finite, non-negative values are accepted.
-  assert.equal(parseSpendCeiling('0'), 0);
+  // ZERO IS REJECTED. M27 found that accepting it inverted the control:
+  // a 0 ceiling produced a 0 per-call reservation, which makes the
+  // governor's `spent + reserved + 0 > limit` test false forever and lets
+  // unlimited real calls through a ceiling that appears to forbid them.
+  // See groq-config.js's `isUsableCeiling` and test 786.
+  for (const zero of ['0', '0.0', '-0', '0.00', 0, -0]) {
+    assert.equal(parseSpendCeiling(zero), null, 'a zero ceiling must fail closed, never mean "free"');
+  }
+  // Only finite, STRICTLY POSITIVE values are accepted.
   assert.equal(parseSpendCeiling('1.50'), 1.5);
   assert.equal(parseSpendCeiling(2), 2);
+  assert.equal(parseSpendCeiling('0.0001'), 0.0001);
 });
 
 test('702. an invalid or missing spending ceiling disables the provider — never interpreted as unlimited', () => {

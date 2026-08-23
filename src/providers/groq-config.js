@@ -87,14 +87,36 @@ const isNonEmptyString = (v) => typeof v === 'string' && v.trim() !== '';
  */
 export function parseSpendCeiling(raw) {
   if (typeof raw === 'number') {
-    return Number.isFinite(raw) && raw >= 0 ? raw : null;
+    return isUsableCeiling(raw) ? raw : null;
   }
   if (!isNonEmptyString(raw)) return null;
   const trimmed = raw.trim();
   // Reject the words that would otherwise coerce to a non-finite number.
   if (/^[+-]?infinity$/i.test(trimmed) || /^nan$/i.test(trimmed)) return null;
   const parsed = Number(trimmed);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  return isUsableCeiling(parsed) ? parsed : null;
+}
+
+/**
+ * A ceiling must be finite and STRICTLY POSITIVE. Zero is rejected, and
+ * that is not pedantry — M27 found it inverts the control it looks like.
+ *
+ * `GROQ_MAX_SPEND_USD=0` reads to an operator as "spend nothing." What it
+ * actually produced was a per-call reservation of 0, which makes the
+ * governor's `spent + reserved + 0 > limit` test false forever: every
+ * budget at every scope becomes structurally unenforceable, and an
+ * unlimited number of real, paid calls goes out under a ceiling that
+ * appears to forbid all of them. Measured, not theorized — 25 of 25 calls
+ * reached the network against a 0.01 USD global budget.
+ *
+ * This is the same failure mode M25 documented for an `undefined`
+ * ceiling (`NaN > limit` is always false) and fixed one value short of.
+ * An operator who genuinely wants to spend nothing unsets
+ * AI_HQ_REAL_PROVIDER_ENABLED or sets GROQ_ENABLED=false; a ceiling of
+ * zero is a configuration mistake, and it now fails closed like one.
+ */
+function isUsableCeiling(n) {
+  return Number.isFinite(n) && n > 0;
 }
 
 /** Only an https:// URL is ever accepted — see GROQ_DEFAULT_BASE_URL. */
@@ -170,3 +192,45 @@ export function readGroqConfig(env = {}) {
 export function isLiveGroqAuthorized(env = {}) {
   return readGroqConfig(env).enabled;
 }
+
+/**
+ * Picks THE model for a single controlled activation.
+ *
+ * ── WHY THIS IS A FUNCTION AND NOT `models[0]` IN A SCRIPT ───────────────
+ *
+ * `models[0]` on a multi-model allowlist is a silent substitution on the
+ * one variable that decides what an operator's money is spent on: they
+ * configure two models, the run charges one, and nothing says which. M27
+ * required the operator-selected model be used "exactly as configured,"
+ * and quietly picking the first is not that.
+ *
+ * It lives here, not inline, for the reason M27's mutation testing made
+ * plain: a rule written inside a script that runs `main()` on import can
+ * only be tested by reading its source text, and a source-text test
+ * cannot tell a working rule from a disabled one.
+ *
+ * @param {string[]} models  the parsed GROQ_MODELS allowlist
+ * @returns {{ok:true, model:string} | {ok:false, reason:string, detail:string}}
+ */
+export function selectSingleModel(models) {
+  if (!Array.isArray(models) || models.length === 0) {
+    return {
+      ok: false,
+      reason: GROQ_CONFIG_REASON.NO_MODELS_CONFIGURED,
+      detail: `${GROQ_ENV.MODELS} names no model — nothing can be selected, and no name is ever invented`,
+    };
+  }
+  if (models.length !== 1) {
+    return {
+      ok: false,
+      reason: AMBIGUOUS_MODEL_SELECTION,
+      detail: `${GROQ_ENV.MODELS} must name EXACTLY ONE model for a controlled activation; it names ${models.length}`,
+    };
+  }
+  return { ok: true, model: models[0] };
+}
+
+/** Refusal code for an allowlist that names more than one model where
+ * exactly one is required. Not a configuration ERROR — the allowlist is
+ * valid — so it is deliberately separate from GROQ_CONFIG_REASON. */
+export const AMBIGUOUS_MODEL_SELECTION = 'AMBIGUOUS_MODEL_SELECTION';

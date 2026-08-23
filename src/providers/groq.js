@@ -122,9 +122,19 @@ export function createGroqProvider({ env = process.env, fetchImpl, maxCostPerCal
   // The per-call reservation. Derived from the configured ceiling when
   // the caller does not name one, and NEVER left undefined — see the
   // `maxCostPerCallUsd` note above.
-  const perCall = Number.isFinite(maxCostPerCallUsd) && maxCostPerCallUsd >= 0
+  //
+  // STRICTLY POSITIVE, for the reason `isUsableCeiling` in groq-config.js
+  // documents: a reservation of 0 makes the governor's arithmetic
+  // (`spent + reserved + 0 > limit`) false forever and silently defeats
+  // every budget at every scope. A zero here is refused the same way an
+  // undefined one is, so the only way to reach 0 is a config that is
+  // already disabled — in which case `invoke()` returns before the
+  // network and the value is inert. Test 789 asserts the invariant that
+  // matters: an ENABLED Groq provider always reserves more than zero.
+  const usable = (n) => Number.isFinite(n) && n > 0;
+  const perCall = usable(maxCostPerCallUsd)
     ? maxCostPerCallUsd
-    : (Number.isFinite(config.max_spend_usd) ? config.max_spend_usd : 0);
+    : (usable(config.max_spend_usd) ? config.max_spend_usd : 0);
 
   /**
    * One real Groq chat-completion call.
@@ -230,14 +240,30 @@ export function createGroqProvider({ env = process.env, fetchImpl, maxCostPerCal
       };
     }
 
-    const text = payload?.choices?.[0]?.message?.content;
-    if (typeof text !== 'string') {
+    const rawText = payload?.choices?.[0]?.message?.content;
+    if (typeof rawText !== 'string') {
       return {
         status: 'failed',
         reason: PROVIDER_REASON.PROVIDER_OUTPUT_INVALID,
         detail: 'response contained no choices[0].message.content string',
       };
     }
+
+    // The COMPLETION TEXT is redacted too, not only error text.
+    //
+    // M27 found the gap: `invoke-async.js` writes the provider's `output`
+    // into the `provider.invocation` audit record, so an upstream that
+    // reflects the Authorization header into its completion — a hostile
+    // proxy, a debug echo, a compromised gateway — wrote a LIVE
+    // CREDENTIAL into an append-only, permanent log, and from there into
+    // any artifact built from that output.
+    //
+    // Redacting here, at the credential boundary, fixes it once for every
+    // consumer: this is the only place that holds the key, so nothing
+    // downstream can leak what it never receives. `redact()` is total and
+    // is already applied to every error path; the success path had simply
+    // never been considered hostile.
+    const text = redact(rawText, apiKey);
 
     // Provider-REPORTED usage only. Never estimated, never invented.
     const usage = payload?.usage ?? {};
