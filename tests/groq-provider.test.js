@@ -156,7 +156,8 @@ test('687. (A) src/providers/ contains exactly the expected files — no stray p
     'artifact-bridge.js', 'contracts.js', 'default-registry.js',
     'deterministic-audio.js', 'deterministic-image.js', 'deterministic-subtitle.js',
     'deterministic-text.js', 'deterministic-video.js',
-    'groq-config.js', 'groq.js', 'invoke-async.js', 'invoke.js', 'live-registry.js', 'registry.js',
+    'groq-config.js', 'groq.js', 'invoke-async.js', 'invoke.js', 'live-guard.js',
+    'live-registry.js', 'registry.js',
   ]);
 });
 

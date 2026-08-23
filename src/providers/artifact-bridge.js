@@ -28,7 +28,7 @@
  * discipline is defense in depth, not the only guard.
  */
 
-import { PROVIDER_TYPE } from './contracts.js';
+import { PROVIDER_TYPE, isKnownProviderType } from './contracts.js';
 import { ARTIFACT_TYPE, isKnownArtifactType } from '../artifacts.js';
 
 /** A convenience default mapping a caller MAY use — never applied
@@ -108,8 +108,21 @@ export function buildArtifactRequestFromProviderResult({
   if (!isKnownArtifactType(artifact_type)) {
     throw new Error(`buildArtifactRequestFromProviderResult: unknown artifact_type: ${artifact_type}`);
   }
-  if (!providerResult.provider_type || !providerResult.output) {
-    throw new Error('buildArtifactRequestFromProviderResult: providerResult is missing provider_type or output');
+  // A RECOGNIZED provider_type, not merely a truthy one. `extractContent`
+  // below ends in an unguarded content_ref branch, so an unrecognized
+  // type — an empty string, a number, a caller-supplied label — would
+  // otherwise fall through it and yield an artifact request with no
+  // content, no content_ref, and no mime_type: a silently empty artifact
+  // in a permanent, immutable record rather than a refusal.
+  //
+  // M26 found this the hard way. `resource-governor.js` builds its own
+  // success envelope and drops `provider_type` entirely (see
+  // live-guard.js), so a governed live call arrives here with the field
+  // missing. This guard is the last line of defense against that class
+  // of provenance loss becoming a fabricated artifact — and until M26's
+  // mutation testing, nothing exercised it.
+  if (!isKnownProviderType(providerResult.provider_type) || !providerResult.output) {
+    throw new Error('buildArtifactRequestFromProviderResult: providerResult is missing a recognized provider_type or output');
   }
 
   const extracted = extractContent(providerResult.provider_type, providerResult.output);

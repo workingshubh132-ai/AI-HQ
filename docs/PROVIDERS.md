@@ -228,7 +228,8 @@ credentials.
 > call has been made from this environment, because no `GROQ_API_KEY`
 > was available here — live inference is **GATED**, not proven. The live
 > smoke test is skipped and reports that plainly rather than pretending
-> to pass.
+> to pass. See §3a for M26's controlled-activation work and the full
+> gated-behavior matrix.
 
 ### 3.1 Configuration — three independent gates
 
@@ -353,6 +354,182 @@ GROQ_MAX_SPEND_USD=0.05 \
 The live test makes **exactly one** call, with a tiny prompt and a tiny
 output. No loops, no retry exercises, no concurrency, no deliberate
 rate-limit or quota probing.
+
+## 3a. Controlled live activation (Milestone 26)
+
+M25 built the adapter. M26 asks a narrower, harder question: **if a real
+credential were present, would every governance control actually hold?**
+It is not a "make Groq available everywhere" milestone. The CEO and the
+Content Factory are deliberately **not** wired to Groq.
+
+> **Live status in this repository: LIVE GROQ TEST NOT RUN.** No
+> `GROQ_API_KEY` exists in this environment, so no real Groq call has
+> been made and **no money has been spent**. No credential was
+> fabricated, borrowed from another provider, or substituted. That is a
+> successful **gated** state, not a failure — the system correctly
+> refused to spend. Everything below that describes governance behavior
+> is proven by offline tests against an injected `fetchImpl`; everything
+> that would require a real key is stated as untested.
+
+### 3a.1 The live path did not pass through the Guardian — it does now
+
+Deterministic providers reach a model only through `runtime.js`, whose
+pre-flight has checked global/workflow/agent freezes since M4. The
+**live** provider is different: it is invoked directly through
+`resource-governor.js` → `invoke-async.js` → `groq.js`, a path that never
+touches `runtime.js`. Grepping the whole live chain for `activeFreeze`
+returned **zero** occurrences — the governor is not even given a store.
+
+**A Guardian freeze therefore could not have stopped a paid Groq call.**
+That is precisely the guarantee M26 exists to establish, so it was fixed
+— additively, in a new file, `src/providers/live-guard.js`:
+
+```
+chain.check()  →  global freeze
+               →  workflow freeze
+               →  agent freeze
+               →  agent exists
+               →  active version resolvable
+               →  version approved
+               →  lifecycle active
+                        ↓  only then
+resource-governor  →  call-count ceilings
+                   →  budget reservation (global → agent → workflow → task)
+                        ↓  only then
+invoke-async       →  timeout + clamped retries
+                        ↓  only then
+groq.js            →  the single outbound request
+```
+
+Every denial above the last line costs nothing and **reaches no
+network**. `resource-governor.js` and `guardian.js` were not modified:
+the gate composes *in front of* the governor, the same "compose, don't
+modify" discipline `execution-coordinator.js` used around the workflow
+engine. The gate holds a **read-only view** of the store — it can ask
+whether a freeze is active and can only ever answer "no." It cannot
+impose a freeze, lift one, change a lifecycle state, approve anything,
+alter a budget, reach the Broker, read a credential, or touch the
+network.
+
+### 3a.2 The governor drops provider provenance — a real bug, found here
+
+`resource-governor.js` builds its own success envelope (`output`,
+`usage`, `usage_status`, `estimated_cost`, `actual_cost`, `attempts`) and
+does **not** pass through the inner result's `provider_type`,
+`provider_version`, `provider_usage`, `cost`, or `cost_status`.
+
+For deterministic providers that never mattered — nothing downstream
+built an artifact. For the live provider it matters a great deal:
+`artifact-bridge.js` requires `provider_type` and refuses without it, so
+**a governed live call could not have become an artifact at all**, and
+the provider-reported usage and the honest `UNPRICED_REAL_SPEND` status
+were both silently lost. M25 missed it because its artifact test invoked
+the provider *directly*, bypassing the governor.
+
+`createLiveProviderChain` fixes it without touching the protected
+governor: it wraps the invoker the governor is given, captures that
+call's inner result on a **per-call carrier object** (never shared
+mutable state, so concurrent calls cannot race), and merges the missing
+provenance back onto the governor's envelope. Reservation, settlement,
+and every ceiling remain entirely the governor's own.
+
+### 3a.3 Running the live smoke test
+
+The smoke runner is a **script, not a test** — `npm test` stays offline
+forever, by construction (asserted by test 782).
+
+```bash
+AI_HQ_REAL_PROVIDER_ENABLED=true \
+GROQ_ENABLED=true \
+GROQ_API_KEY=<your key> \
+GROQ_MODELS=<a model you have verified exists> \
+GROQ_MAX_SPEND_USD=0.05 \
+  npm run smoke:groq
+```
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Exactly one real call succeeded, end to end, and became an artifact. |
+| `1` | The call ran and failed (or a credential leak was detected). |
+| `2` | **NOT RUN** — governance or configuration refused before any network access. This is a success state for a gated environment. |
+
+It makes **exactly one** request with `max_retries: 0`, a tiny prompt and
+a tiny output. It counts real network calls by wrapping `globalThis.fetch`
+and reports the count. It performs a credential-containment check against
+the result envelope, the artifact, and the audit log using the real key,
+and exits `1` if the key appears in any of them — the key is used for
+that comparison only and is **never printed**.
+
+Never run it repeatedly while debugging. Every successful run spends real
+money.
+
+### 3a.4 What happens without a valid key
+
+| Situation | Result | Network calls |
+| --- | --- | --- |
+| No `AI_HQ_REAL_PROVIDER_ENABLED` | Groq absent from the registry entirely | 0 |
+| `GROQ_ENABLED=false` | Groq absent; other providers unaffected | 0 |
+| No `GROQ_API_KEY` | `NO_CREDENTIAL` — provider not registered | 0 |
+| No/invalid `GROQ_MAX_SPEND_USD` | Fails closed — a missing ceiling never means "unlimited" | 0 |
+| Empty `GROQ_MODELS` | `NO_MODELS_CONFIGURED` — no model name is ever invented | 0 |
+| Model outside the allowlist | `MODEL_NOT_SUPPORTED` at the registry boundary | 0 |
+| Credential revoked mid-life | Config is re-read at **call** time; spending stops immediately | 0 |
+| Credential vanishes between the config gate and the request build | `PROVIDER_CONFIGURATION_INVALID` — never an unauthenticated request | 0 |
+| Insufficient budget at **any** scope | `*_MODEL_BUDGET_EXCEEDED`, reservation released | 0 |
+| Call-count ceiling reached | `MODEL_CALL_LIMIT` | 0 |
+| Any Guardian freeze, or a disabled/paused/unapproved/unknown agent | Denied at `live-guard.js`, audited with `network_attempted: false` | 0 |
+| An **invalid** key (HTTP 401/403) | `PROVIDER_AUTH_FAILED` — **never retried**, exactly one request | 1 |
+
+The last row is the only one that spends anything, and it is deliberately
+non-retryable: retrying a rejected credential only burns quota against a
+failure that is identical next time.
+
+### 3a.5 Why the CEO cannot activate Groq
+
+The CEO (M24) holds `clearance: GREEN` and `allowed_tools: []`, and is
+governed by exactly the same Broker, Guardian, Approval Engine, and
+lifecycle machinery as every other agent. Structurally, no CEO file
+references a credential, the network, a provider registry, a budget, or
+the live gate — asserted directly by test 779. The CEO therefore cannot
+enable Groq, read `GROQ_API_KEY`, change a budget, change a retry or call
+limit, bypass the Guardian, approve its own YELLOW actions, select a
+provider, choose a model, or authorize spending. Live provider activation
+is an **operator** act performed through the environment, and nothing the
+CEO can produce — including output shaped exactly like an authorization
+decision — is authorization.
+
+### 3a.6 Why the Content Factory stays deterministic
+
+The twelve specialists (M23) continue to run against deterministic
+providers. Wiring them to Groq would multiply one governed call into a
+nine-stage pipeline of paid calls, which is exactly the uncontrolled
+spending M26 is meant to rule out. The Factory's quality-control checks
+remain a pure function labelled `DETERMINISTIC_STRUCTURAL_CHECK` — they
+are structural assertions, not model judgment, and they stay that way.
+
+### 3a.7 Live vs offline tests
+
+| | Offline suite (`npm test`) | Live smoke (`npm run smoke:groq`) |
+| --- | --- | --- |
+| Credentials | none, ever | a real `GROQ_API_KEY` |
+| Network | zero egress — every request is observed through an injected `fetchImpl` | exactly one real request |
+| Cost | zero | real, unpriced |
+| Runs in CI | yes | no — never automatic |
+| Present in this repo's results | yes, 822 tests | **NOT RUN** here |
+
+The offline suite observes exactly what *would* be sent — URL, method,
+headers, body — without sending it. That is how credential placement,
+budget refusal, freeze refusal, retry bounds, and failure classification
+are all proven without spending a cent.
+
+### 3a.8 Units are not tokens
+
+The resource governor's accounting units are `JSON.stringify(...).length`,
+**not** real tokens. Groq's own reported `prompt_tokens` /
+`completion_tokens` are recorded separately under `provider_usage` with
+`provider_reported: true`. The two are never blended, and a real call is
+reported as `UNPRICED_REAL_SPEND` — never `$0.00`, and never a fabricated
+price. AI-HQ does not know Groq's pricing and does not guess it.
 
 ## 4. Future image provider
 

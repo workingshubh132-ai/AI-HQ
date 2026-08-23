@@ -420,6 +420,19 @@ const CREDENTIAL_BOUNDARY_FILES = Object.freeze({
   '../src/providers/live-registry.js': ['process.env'],
 });
 
+/** `activeFreeze()` is a READ of the Guardian's state, not an exercise of
+ * its authority — the one Guardian term a provider file may legitimately
+ * contain, and only in the file whose entire job is to refuse a paid call
+ * when a freeze is in force. Every term that CREATES or LIFTS authority
+ * (`addFreeze(`, `createGuardian(`, lifecycle setters, budget mutation)
+ * stays forbidden here too. Asserted exactly (test 504b) so a second file
+ * cannot quietly start reading Guardian state. */
+const GUARDIAN_READ_FILES = Object.freeze({
+  // M26: the live-provider Guardian gate. It may ASK whether a freeze is
+  // active; it can never impose, lift, or alter one.
+  '../src/providers/live-guard.js': ['activeFreeze('],
+});
+
 test('504. (#25, #26, #27, #28) no file under src/providers/ references the Broker, Guardian, Approval Engine, or any store-mutation/lifecycle method', () => {
   const forbidden = [
     'broker.execute(', 'broker.authorize(', 'createBroker(', // #25 Broker
@@ -430,10 +443,28 @@ test('504. (#25, #26, #27, #28) no file under src/providers/ references the Brok
   ];
   for (const path of PROVIDER_SOURCE_FILES) {
     const src = readFileSync(new URL(path, import.meta.url), 'utf8');
+    const readOnly = GUARDIAN_READ_FILES[path] ?? [];
     for (const term of forbidden) {
+      if (readOnly.includes(term)) continue;
       assert.ok(!src.includes(term), `${path} must not reference "${term}"`);
     }
   }
+});
+
+test('504b. (#26) exactly one provider file may READ Guardian state, and it still holds no Guardian authority', () => {
+  assert.deepEqual(Object.keys(GUARDIAN_READ_FILES), ['../src/providers/live-guard.js']);
+
+  const src = readFileSync(new URL('../src/providers/live-guard.js', import.meta.url), 'utf8');
+  // It reads freezes...
+  assert.ok(src.includes('activeFreeze('), 'the gate must actually consult the Guardian');
+  // ...and can do nothing else with them. These are the authority terms,
+  // still forbidden in the one file granted the read.
+  for (const term of ['addFreeze(', 'createGuardian(', 'liftFreeze(', 'removeFreeze(']) {
+    assert.ok(!src.includes(term), `live-guard.js must not reference "${term}"`);
+  }
+  // The read-only facade is what its logic actually holds, so no store
+  // mutation method is reachable from any decision it makes.
+  assert.ok(src.includes('function readOnlyStore'), 'the gate wraps the store read-only');
 });
 
 test('505. (#29) the registry exposes no way for a provider or model output to register a new provider at runtime', () => {
@@ -550,8 +581,9 @@ test('513. structural: every file exported from src/providers/ is actually reach
     // This inventory is deliberately exact — it exists to catch an
     // UNEXPECTED file appearing here — so a genuinely new, reviewed file
     // updates the list rather than loosening the assertion.
-    'groq-config.js', 'groq.js', 'invoke-async.js',
-    'invoke.js', 'live-registry.js', 'registry.js',
+    'groq-config.js', 'groq.js', 'invoke-async.js', 'invoke.js',
+    // M26 added the live Guardian/lifecycle gate.
+    'live-guard.js', 'live-registry.js', 'registry.js',
   ]);
 });
 
