@@ -395,13 +395,30 @@ test('503. (#24) the provider registry is immutable — no register/add/set meth
 
 // ── 25-29: structural isolation ──────────────────────────────────────────
 
-const PROVIDER_SOURCE_FILES = [
-  '../src/providers/contracts.js', '../src/providers/registry.js', '../src/providers/invoke.js',
-  '../src/providers/artifact-bridge.js', '../src/providers/deterministic-text.js',
-  '../src/providers/deterministic-image.js', '../src/providers/deterministic-audio.js',
-  '../src/providers/deterministic-video.js', '../src/providers/deterministic-subtitle.js',
-  '../src/providers/default-registry.js',
-];
+/** Derived from the directory itself rather than hand-listed, so a file
+ * added to `src/providers/` in any future milestone is swept
+ * automatically instead of silently escaping these checks — which is
+ * exactly what a stale hand-written list allowed until M25 noticed it. */
+const PROVIDER_SOURCE_FILES = readdirSync(new URL('../src/providers/', import.meta.url))
+  .filter((f) => f.endsWith('.js'))
+  .sort()
+  .map((f) => `../src/providers/${f}`);
+
+/** The ONLY files permitted to touch a credential or the network, and
+ * why. Everything else under `src/providers/` must contain neither.
+ * Asserted exactly (test 514b) so a new file cannot quietly join this
+ * list. */
+const CREDENTIAL_BOUNDARY_FILES = Object.freeze({
+  // M25: the real Groq adapter — the single outbound-request call site
+  // in the entire codebase, and the only reader of GROQ_API_KEY.
+  '../src/providers/groq.js': ['fetch(', 'process.env', 'API_KEY', 'GROQ_API_KEY', 'apiKey'],
+  // M25: names the environment VARIABLES (it never reaches for the
+  // ambient environment itself — the env object is injected) and reports
+  // only a boolean `has_credential`, never a credential value.
+  '../src/providers/groq-config.js': ['API_KEY', 'GROQ_API_KEY'],
+  // M25: passes `process.env` through to the adapter at construction.
+  '../src/providers/live-registry.js': ['process.env'],
+});
 
 test('504. (#25, #26, #27, #28) no file under src/providers/ references the Broker, Guardian, Approval Engine, or any store-mutation/lifecycle method', () => {
   const forbidden = [
@@ -529,19 +546,50 @@ test('513. structural: every file exported from src/providers/ is actually reach
   assert.deepEqual(files, [
     'artifact-bridge.js', 'contracts.js', 'default-registry.js', 'deterministic-audio.js',
     'deterministic-image.js', 'deterministic-subtitle.js', 'deterministic-text.js', 'deterministic-video.js',
-    'invoke.js', 'registry.js',
+    // M25 added the real Groq provider and its async invocation path.
+    // This inventory is deliberately exact — it exists to catch an
+    // UNEXPECTED file appearing here — so a genuinely new, reviewed file
+    // updates the list rather than loosening the assertion.
+    'groq-config.js', 'groq.js', 'invoke-async.js',
+    'invoke.js', 'live-registry.js', 'registry.js',
   ]);
 });
 
-test('514. structural: no new network, credential, or shell-execution primitive anywhere under src/providers/', () => {
+test('514. structural: no network, credential, or shell-execution primitive anywhere under src/providers/, outside the documented credential boundary', () => {
+  // Terms forbidden EVERYWHERE, with no exception for any file: these
+  // would be alarming even inside the provider adapter.
+  const ALWAYS_FORBIDDEN = [
+    'node:http', 'node:https', 'node:net', 'node:tls', 'child_process', 'node:worker_threads',
+    'axios', 'undici', 'node-fetch', 'WebSocket', 'execSync', 'spawnSync', 'eval(',
+    'ANTHROPIC_API_KEY', 'api_key',
+  ];
+  // Terms permitted ONLY inside the credential/network boundary files.
+  const BOUNDARY_TERMS = ['fetch(', 'process.env', 'API_KEY', 'GROQ_API_KEY', 'apiKey'];
+
   for (const path of PROVIDER_SOURCE_FILES) {
     const src = readFileSync(new URL(path, import.meta.url), 'utf8');
-    for (const term of [
-      'node:http', 'node:https', 'node:net', 'child_process', 'fetch(', 'axios', 'WebSocket',
-      'process.env', 'API_KEY', 'ANTHROPIC_API_KEY', 'GROQ_API_KEY', 'apiKey', 'api_key',
-    ]) {
+    for (const term of ALWAYS_FORBIDDEN) {
       assert.ok(!src.includes(term), `${path} must not contain "${term}"`);
     }
+    const allowed = CREDENTIAL_BOUNDARY_FILES[path] ?? [];
+    for (const term of BOUNDARY_TERMS) {
+      if (allowed.includes(term)) continue;
+      assert.ok(!src.includes(term), `${path} is outside the credential boundary and must not contain "${term}"`);
+    }
+  }
+});
+
+test('514b. structural: the credential/network boundary is exactly three named files — nothing else may join it', () => {
+  // If a future file starts reading a credential or calling fetch, this
+  // assertion fails until someone deliberately adds it here, in review.
+  assert.deepEqual(Object.keys(CREDENTIAL_BOUNDARY_FILES).sort(), [
+    '../src/providers/groq-config.js',
+    '../src/providers/groq.js',
+    '../src/providers/live-registry.js',
+  ]);
+  // And every named boundary file really exists.
+  for (const path of Object.keys(CREDENTIAL_BOUNDARY_FILES)) {
+    assert.ok(PROVIDER_SOURCE_FILES.includes(path), `${path} must exist under src/providers/`);
   }
 });
 

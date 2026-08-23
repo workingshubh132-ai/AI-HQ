@@ -2638,6 +2638,133 @@ mechanism of any kind.
 
 ---
 
+## D42 — Groq: the first real provider, off by default, governed before the network
+
+Decided 2026-08-23 (Milestone 25).
+
+`src/providers/groq.js` connects the first real, paid, external
+inference provider to the provider architecture built in M21 and wired
+into execution in M22. It conforms to the EXISTING contract unchanged —
+the contract was not bent to accommodate it.
+
+**No protected file was modified.** `broker.js`, `validator.js`,
+`guardian.js`, `approval-engine.js`, `router.js`, `workflow.js`,
+`execution-coordinator.js`, `runtime.js`, `ceo-agent.js`, `src/ceo/`,
+`resource-governor.js`, `artifact-service.js`, and — importantly —
+`src/providers/invoke.js` and `default-registry.js` are all untouched.
+The only edits to existing files are two additive enum entries in
+`contracts.js`, a documentation update, and test updates.
+
+**Why Groq, and why Claude was not required.** The user has no budget
+for Claude API costs and named Groq as the first production provider.
+Nothing in this milestone requires, reads, or falls back to
+`ANTHROPIC_API_KEY`; `provider-anthropic.js` (M12) is untouched and
+remains unwired. Critically, no credential from the build environment
+was used, inferred, or borrowed: **no `GROQ_API_KEY` existed there**, so
+no live call was made and none was fabricated. The live smoke test is
+skipped and says so.
+
+**Offline by default, behind three independent gates.** A credential
+alone deliberately does NOT authorize spending:
+`AI_HQ_REAL_PROVIDER_ENABLED === 'true'`, plus `GROQ_ENABLED !== 'false'`,
+plus a present key AND a valid spend ceiling AND a configured model
+allowlist. With none set, `createLiveProviderRegistry()` returns a
+registry containing only the five deterministic providers — Groq is
+absent entirely rather than present-but-disabled, so a request naming it
+fails closed with `PROVIDER_NOT_FOUND` before any adapter code runs.
+Gates are re-read at CALL time, not construction time, so revoking
+configuration under a live provider stops spending immediately
+(test 700).
+
+**The spend ceiling can never mean "unlimited."** `parseSpendCeiling()`
+accepts only a finite, non-negative number. `undefined`, `null`, `''`,
+`NaN`, `Infinity`, `-Infinity`, negatives, and unparseable strings are
+each rejected and DISABLE the provider. There is no code path producing
+an unbounded ceiling, and mutation-testing the check (`return parsed`)
+is caught immediately.
+
+**The credential boundary is real and test-enforced.** The key is read
+once, inside `invoke()`, and placed only in the outbound `Authorization`
+header. Tests prove it never reaches the request body, an audit record,
+the returned envelope, `provider_usage`, an artifact, or an error — even
+when a deliberately leaky upstream echoes the header back in its error
+body, `redact()` strips it. The config object carries a boolean
+`has_credential` and never the value. M21's provider sweep (test 514)
+was found to use a STALE hand-written file list that would have left the
+new files unswept; it is now derived from the directory itself, with a
+three-file credential boundary asserted exactly (test 514b) so no future
+file can quietly join it.
+
+**Governance runs before the network — proven with a request counter.**
+Every real invocation composes with the EXISTING, unmodified
+`resource-governor.js`; no second budget system was built. When the
+governor denies, `fetch` is never called (tests 711–714 assert a call
+count of zero across budget denial, unconfigured-scope denial, budget
+exhaustion, and the per-task call ceiling). An unconfigured budget scope
+DENIES rather than being read as unlimited. `max_cost_per_call` is
+always a real number — the M21 lesson (D38) where `undefined` made the
+governor's reservation evaluate `NaN > limit`, always false, silently
+defeating enforcement.
+
+**A third application of the sync/async precedent.** A real network call
+cannot be synchronous, and `invoke.js` is synchronous because
+`runtime.js`'s `generateContent` closure (M22), the Content Factory
+(M23), and the CEO (M24) all call it without awaiting. Rather than
+break them, M25 added `invoke-async.js`: the same governed pipeline
+mirrored with `await` and a genuine preemptive timeout, reusing
+`contracts.js`'s vocabulary and validators so no ceiling can drift.
+This is exactly what `model-runtime.js`/`async-model-runtime.js` (M12)
+and `createArtifact`/`createArtifactSync` (M20) already did for the same
+reason, stated in `async-model-runtime.js`'s own header.
+
+**Two additive failure codes.** The directive requires distinguishing
+authentication and configuration failures, which the M21 vocabulary
+could not express because no provider had ever needed them.
+`PROVIDER_AUTH_FAILED` and `PROVIDER_CONFIGURATION_INVALID` were added
+to `PROVIDER_REASON` — purely additive, no existing check reads either,
+every pre-M25 code unchanged (test 739), and NEITHER is retry-safe.
+Retrying a rejected credential only burns quota against a failure that
+will be identical next time.
+
+**Models are configuration, never invented.** This repository ships no
+hardcoded Groq model identifier. Groq's supported list changes over time
+and could not be verified against authoritative Groq documentation from
+the build environment, so naming one would have been fabrication.
+`GROQ_MODELS` is an operator-supplied allowlist; anything outside it
+fails closed without reaching the network. A test greps both Groq files
+for common model-family names to keep it that way.
+
+**Cost accounting is honest.** Provider-REPORTED usage only. With no
+verified price table, a real call reports `cost: null` and
+`cost_status: 'UNPRICED_REAL_SPEND'` — never `$0.00` merely because the
+price is unknown, and never confused with a deterministic provider's
+genuine `DETERMINISTIC_NO_EXTERNAL_COST`.
+
+**No new dependency.** Node's built-in `fetch` (stable since Node 18;
+this project already requires `>=20`) is used through an injected
+`fetchImpl`, so `package.json` and `package-lock.json` are untouched, no
+supply-chain surface was added, and every test observes exactly what
+would be sent without a byte leaving the machine.
+
+**CEO, Broker, Guardian, and Approval authority are unchanged.** The CEO
+gained nothing: it cannot enable a provider, read a credential, change a
+budget, or name a provider at all — its plans reference capabilities
+only, asserted structurally (tests 733–734). A Guardian freeze still
+stops execution before any handler, and therefore before any paid call.
+A YELLOW tool action still requires a human.
+
+**What this milestone deliberately does not do.** No second provider
+(no OpenAI, Gemini, or Claude). No CEO integration of the live provider
+— the CEO still reaches only `default-registry.js`'s deterministic set,
+and widening that was explicitly out of scope; connecting it is a
+future, separately-reviewed step. No quota, rate-limit, billing, or
+authentication bypass of any kind — a 429 is classified and reported,
+never worked around, and no key rotation or account-switching mechanism
+exists. No autonomous purchasing, publishing, or external
+communication.
+
+---
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

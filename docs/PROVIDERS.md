@@ -14,12 +14,17 @@ unchanged since M21. `broker.js`, `validator.js`, `guardian.js`,
 anything under `src/providers/` — only `runtime.js` now does, and only
 through the one narrow `providerInvoker` dependency described below.
 
-Today, every registered provider is **deterministic** — a pure function
+**By default, every provider in use is deterministic** — a pure function
 producing clearly synthetic fixture output, never a real network call.
-This document explains the architecture, what exists today, and exactly
-where a real provider (starting with Groq, since that's the user's
-stated future direction) would plug in later, without pretending that
-integration exists yet.
+As of Milestone 25 a real provider (**Groq**) genuinely exists (§3), but
+it is **off unless explicitly configured**: with no configuration, AI-HQ
+makes zero network calls and requires zero credentials, and the
+deterministic providers remain the only ones registered.
+
+No live Groq call has been made from the environment this repository was
+built in, because no credential was available there. The adapter and its
+full offline test suite are real and passing; live inference is **gated**,
+and this document never describes it as proven.
 
 ## 1. Provider architecture
 
@@ -211,61 +216,143 @@ nothing real. `invoke.js` itself reports `cost: 0, cost_status:
 'DETERMINISTIC_NO_EXTERNAL_COST'` on every successful deterministic call.
 **Never read this as a claim about what a real provider would cost.**
 
-## 3. Future Groq adapter
+## 3. Groq — the first REAL provider (Milestone 25)
 
-**No Groq adapter exists in this repository today.** This section
-documents where one would plug in — it is not a promise that it works,
-and it must never be described as connected until an actual adapter
-file exists and is tested.
+**Groq is really implemented** (`src/providers/groq.js`) and conforms to
+the existing provider contract unchanged. It is **OFF by default**: with
+nothing configured, AI-HQ makes zero network calls and needs zero
+credentials.
 
-The concrete precedent is `src/provider-anthropic.js` (M12): a real,
-tested provider definition satisfying `providers.js`'s registry shape,
-whose `invoke()` reads `process.env.ANTHROPIC_API_KEY` **only inside
-itself, at call time** — never logged, never stored on an envelope,
-never in an audit record. It is consumed exclusively through
-`async-model-runtime.js` (M12), never the synchronous `model-runtime.js`,
-because a real network call cannot be synchronous in Node.js.
+> **Live status in this repository:** the adapter, its governance, and
+> its full offline test suite are complete and passing. No live Groq
+> call has been made from this environment, because no `GROQ_API_KEY`
+> was available here — live inference is **GATED**, not proven. The live
+> smoke test is skipped and reports that plainly rather than pretending
+> to pass.
 
-A future Groq adapter would follow the identical shape, under
-`src/providers/`:
+### 3.1 Configuration — three independent gates
 
-```js
-// src/providers/live-groq-text.js (DOES NOT EXIST YET)
-export const GROQ_TEXT_PROVIDER = Object.freeze({
-  provider_type: PROVIDER_TYPE.TEXT_GENERATION,
-  provider_version: '<groq api version>',
-  deterministic: false,
-  enabled: true,
-  models: {
-    '<a real groq model id>': Object.freeze({
-      max_input_units, max_output_units, timeout_ms, default_max_retries,
-      async invoke({ input }) {
-        const apiKey = process.env.GROQ_API_KEY;
-        if (!apiKey) throw new Error('GROQ_API_KEY is not configured — no real Groq call can be made');
-        // ... call Groq's API here, return {status, output, usage} ...
-      },
-    }),
-  },
-});
+All three must hold before one real call is made. **A key alone is
+deliberately not enough.**
+
+| Variable | Purpose |
+|---|---|
+| `AI_HQ_REAL_PROVIDER_ENABLED` | Project-wide opt-in to ANY real provider. Must be exactly `"true"`. |
+| `GROQ_ENABLED` | Per-provider off switch. `"false"` disables Groq without disabling others. |
+| `GROQ_API_KEY` | The credential. Read only inside `invoke()`, at call time. |
+| `GROQ_MAX_SPEND_USD` | **Hard** per-call ceiling reserved by the resource governor. No value means DISABLED — never "unlimited". |
+| `GROQ_MODELS` | Comma-separated allowlist of model IDs. AI-HQ ships **no default model name**. |
+| `GROQ_BASE_URL` | Optional. `https://` only — a plain-http override is refused. |
+
+### 3.2 Models are configuration, never invented
+
+This repository ships **no hardcoded Groq model identifier**. Groq's
+supported model list changes over time and could not be verified against
+authoritative Groq documentation from the build environment, so
+inventing one would be fabrication. Operators supply `GROQ_MODELS` from
+<https://console.groq.com/docs/models>. A request naming anything outside
+that allowlist fails closed with `MODEL_NOT_SUPPORTED` and never reaches
+the network.
+
+### 3.3 Credential handling
+
+The key is read from the environment **once, inside `invoke()`**, and
+placed in exactly one location: the outbound `Authorization` header. It
+is test-proven never to appear in:
+
+the request **body** · **audit** records · the returned **envelope** ·
+`provider_usage` · **artifacts** or provenance · **error messages**
+(every error passes through `redact()`, which strips the key even when
+an upstream echoes it back) · **prompts**.
+
+The configuration object itself carries only a boolean `has_credential`
+— never the value, a prefix, a length, or a hash.
+
+### 3.4 Resource governance runs BEFORE the network
+
+Every real invocation composes with the **existing, unmodified**
+`resource-governor.js` — no second budget system was built. When the
+governor denies, **the HTTP request is never sent**, proven with a
+request counter (tests 711–714): global/agent/workflow/task budgets,
+per-task call ceiling, input and output ceilings, retry ceiling, and
+timeout all apply. An unconfigured budget scope **denies**; it is never
+read as unlimited.
+
+`max_cost_per_call` is always a real number, never `undefined` — the
+M21 lesson (D38) where an undefined value made the governor's
+reservation arithmetic evaluate `NaN > limit` (always false) and
+silently defeat budget enforcement.
+
+### 3.5 Failure classification and retries
+
+| Condition | Reason | Retried? |
+|---|---|---|
+| 401 / 403 | `PROVIDER_AUTH_FAILED` | **Never** |
+| Local config unmet | `PROVIDER_CONFIGURATION_INVALID` | **Never** (no request built) |
+| 400 | `INVALID_REQUEST` | Never |
+| 404 | `MODEL_NOT_SUPPORTED` | Never |
+| 429 | `PROVIDER_RATE_LIMITED` | Bounded |
+| 5xx / transport | `PROVIDER_UNAVAILABLE` | Bounded |
+| Slow / hung | `PROVIDER_TIMEOUT` | Bounded (preemptive) |
+| Non-JSON or shapeless | `PROVIDER_OUTPUT_INVALID` | Never |
+
+Retries are clamped by `MAX_RETRY_CEILING` regardless of what a caller
+requests — asking for 999 retries against a paid API yields at most 4
+attempts. The provider never decides its own retry count. Nothing in
+this codebase reacts to a rate limit by rotating keys, switching
+accounts, or retrying without bound.
+
+### 3.6 Cost accounting is honest
+
+Provider-**reported** usage only (`prompt_tokens`, `completion_tokens`,
+`total_tokens`, `model`, `request_id`). No price table is invented, so a
+real call reports:
+
+```
+cost: null
+cost_status: "UNPRICED_REAL_SPEND"
 ```
 
-Registering it would mean adding one entry to a `providerDefs` map
-passed to `createContentProviderRegistry(...)` — additive, not a change
-to `registry.js`, `invoke.js`, or `artifact-bridge.js`. Because
-`invoke()` would be `async`, it would need an async-capable governed
-invoker — the same `createAsyncModelRuntime` vs `model-runtime.js` split
-M12 already established for text, mirrored for this layer, not built in
-M21 because nothing async-capable is needed until a real adapter exists.
+It is **never** reported as `$0.00` merely because the price is unknown.
+Deterministic providers keep reporting a genuine
+`DETERMINISTIC_NO_EXTERNAL_COST` — the two are never confused.
 
-**Groq readiness today is structural, not proven by a working
-integration**: nothing currently depends on `src/providers/` at all, so
-adding a provider entry cannot possibly require touching `broker.js`,
-`validator.js`, `guardian.js`, `approval-engine.js`, `router.js`,
-`workflow.js`, or `execution-coordinator.js` — there is no dependency
-edge from any of them to break. The real test of "readiness" is that
-`provider-anthropic.js` already proves this exact pattern (credential
-isolated inside `invoke()`, async, registered as one more entry) works
-in this codebase, for a different real provider, today.
+### 3.7 The async invocation path
+
+A real network call cannot be synchronous, and `invoke.js` is
+synchronous because `runtime.js`'s `generateContent` closure (M22), the
+Content Factory (M23), and the CEO (M24) all call it without awaiting.
+So M25 added `invoke-async.js`: the **same governed pipeline**, mirrored
+with `await` and a genuine preemptive timeout. `invoke.js` is unmodified.
+
+This is the codebase's own settled pattern, applied a third time —
+`model-runtime.js`/`async-model-runtime.js` (M12) and
+`createArtifact`/`createArtifactSync` (M20) resolved the identical
+dilemma the identical way.
+
+### 3.8 Replacing the provider
+
+`default-registry.js` (the five deterministic providers) is untouched,
+so every existing caller — including the CEO — still cannot reach a paid
+provider at all. Groq is added only by `createLiveProviderRegistry()`,
+and only when fully authorized. Swapping in a different real provider is
+a new adapter file plus a registry entry: no governance, CEO, workflow,
+or Broker change.
+
+### 3.9 Testing
+
+```bash
+npm test                      # offline: zero credentials, zero network
+AI_HQ_REAL_PROVIDER_ENABLED=true \
+GROQ_API_KEY=... \
+GROQ_MODELS=<a-model-you-verified> \
+GROQ_MAX_SPEND_USD=0.05 \
+  node --test tests/groq-provider.test.js   # + one real smoke call
+```
+
+The live test makes **exactly one** call, with a tiny prompt and a tiny
+output. No loops, no retry exercises, no concurrency, no deliberate
+rate-limit or quota probing.
 
 ## 4. Future image provider
 

@@ -74,6 +74,13 @@ export const PROVIDER_REASON = Object.freeze({
   PROVIDER_ERROR: 'PROVIDER_ERROR', // same meaning as MODEL_REASON.PROVIDER_ERROR — an opaque, non-retry-safe failure
   PROVIDER_OUTPUT_INVALID: 'PROVIDER_OUTPUT_INVALID', // genuinely new: output failed this file's own shape validator
   PROVIDER_CONTRACT_VIOLATION: 'PROVIDER_CONTRACT_VIOLATION', // genuinely new: the CALLER's request itself violates this file's contract (e.g. unsupported artifact_type for the category)
+  // ── added in M25, when a real network provider first made them
+  // distinguishable. Purely additive: no existing check reads either,
+  // and NEITHER is retry-safe (see RETRYABLE_PROVIDER_REASONS below) —
+  // retrying a rejected credential or a broken configuration only burns
+  // quota against a failure that will be identical next time.
+  PROVIDER_AUTH_FAILED: 'PROVIDER_AUTH_FAILED', // the provider rejected the credential (HTTP 401/403). NEVER retried.
+  PROVIDER_CONFIGURATION_INVALID: 'PROVIDER_CONFIGURATION_INVALID', // the local configuration is missing/unusable (no credential, no spend ceiling, provider not enabled). NEVER retried, and never reaches the network.
 });
 
 /**
