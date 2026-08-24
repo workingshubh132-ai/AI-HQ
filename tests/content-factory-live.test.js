@@ -571,6 +571,7 @@ test('827. (M28) ONE provider call per task is structural — a second generateC
   const request = {
     provider_id: LIVE_TEXT_CAPABILITY_ID, artifact_type: ARTIFACT_TYPE.SCRIPT,
     input: buildLiveScriptPrompt(stack.scriptInput), agent_slug: S.SCRIPT_LIVE,
+    task_id: TASK, tree_id: WORKFLOW,
   };
 
   const first = invoker.invoke(request);
@@ -628,6 +629,7 @@ test('830. (M28) the handler cannot obtain content for a request governance did 
   const mismatched = invoker.invoke({
     provider_id: LIVE_TEXT_CAPABILITY_ID, artifact_type: ARTIFACT_TYPE.SCRIPT,
     input: { text: 'something else entirely' }, agent_slug: S.SCRIPT_LIVE,
+    task_id: TASK, tree_id: WORKFLOW,
   });
   assert.equal(mismatched.status, 'failed');
   assert.equal(mismatched.reason, LIVE_STAGE_REASON.LIVE_REQUEST_MISMATCH);
@@ -644,7 +646,7 @@ test('830. (M28) the handler cannot obtain content for a request governance did 
   const withForgedModel = invoker.invoke({
     provider_id: LIVE_TEXT_CAPABILITY_ID, model_id: 'attacker-model',
     artifact_type: ARTIFACT_TYPE.SCRIPT, input: buildLiveScriptPrompt(stack.scriptInput),
-    agent_slug: S.SCRIPT_LIVE,
+    agent_slug: S.SCRIPT_LIVE, task_id: TASK, tree_id: WORKFLOW,
   });
   assert.equal(withForgedModel.status, 'ok', 'a forged model_id changes nothing');
   assert.equal(withForgedModel.model_id, MODEL);
@@ -751,13 +753,20 @@ test('836. (M28) the live-stage module holds no network, no credential, and no r
   }
 });
 
-test('837. (M28) exactly one handler in the Content Factory names the live sentinel', () => {
+test('837. (M28, revised by M29) exactly the FOUR designated text stages name the live sentinel — never a fifth', () => {
+  // M28 asserted "exactly one" because exactly one live stage existed.
+  // M29 deliberately adds three more TEXT stages — research, hook,
+  // social-package — and this test now asserts the NEW ceiling exactly,
+  // the same discipline M28 applied to test 805 when its own invariant
+  // needed to change on purpose rather than be quietly relaxed.
   const src = readFileSync(new URL('../src/content-factory-agents.js', import.meta.url), 'utf8');
   const uses = src.split('provider_id: LIVE_TEXT_CAPABILITY_ID').length - 1;
-  assert.equal(uses, 1, 'exactly one handler may name the live sentinel');
-  // And every other handler still names a deterministic provider.
+  assert.equal(uses, 4, 'exactly four handlers may name the live sentinel: research, script, hook, social-package');
+  // And every other handler still names a deterministic provider — audio,
+  // image, video, subtitle, and publishing are never live (directive
+  // section 5).
   const deterministic = src.split("provider_id: 'deterministic-").length - 1;
-  assert.ok(deterministic >= 10, `the other stages stay deterministic (found ${deterministic})`);
+  assert.ok(deterministic >= 8, `the other stages stay deterministic (found ${deterministic})`);
 });
 
 test('838. (M28) the deterministic Content Factory still works, end to end, entirely offline', async () => {
@@ -802,11 +811,18 @@ test('838. (M28) the deterministic Content Factory still works, end to end, enti
   }
 });
 
-test('839. (M28) src/ gained exactly one new module, and it is the live-stage boundary', () => {
+test('839. (M28, revised by M29) src/ gained exactly the live-stage boundary modules — nothing stray', () => {
+  // M28 asserted "exactly one new module." M29 deliberately adds a
+  // second — content-factory-live-pipeline.js, the multi-stage
+  // orchestration glue — and test 883 in
+  // tests/content-factory-live-pipeline.test.js now asserts the current
+  // expected set directly. This test keeps the SAME discipline M28
+  // established (a stray live/groq module fails the build) without
+  // duplicating that assertion's exact list.
   const files = readdirSync(new URL('../src/', import.meta.url)).filter((f) => f.endsWith('.js')).sort();
-  assert.ok(files.includes('content-factory-live.js'));
-  // No stray live-provider module appeared anywhere else.
-  const unexpected = files.filter((f) => /live|groq/i.test(f) && f !== 'content-factory-live.js');
+  const EXPECTED_LIVE_MODULES = ['content-factory-live-pipeline.js', 'content-factory-live.js'];
+  for (const expected of EXPECTED_LIVE_MODULES) assert.ok(files.includes(expected));
+  const unexpected = files.filter((f) => /live|groq/i.test(f) && !EXPECTED_LIVE_MODULES.includes(f));
   assert.deepEqual(unexpected, [], 'no other live module may appear in src/');
 });
 
@@ -1035,7 +1051,7 @@ test('849. (M28) a VALID ticket cannot be consumed by a different stage in the s
     const stolen = invoker.invoke({
       provider_id: LIVE_TEXT_CAPABILITY_ID,
       input: buildLiveScriptPrompt(stack.scriptInput),
-      agent_slug: thief,
+      agent_slug: thief, task_id: TASK, tree_id: WORKFLOW,
     });
     assert.equal(stolen.status, 'failed', `${thief} must not consume another stage's paid result`);
     assert.equal(stolen.reason, LIVE_STAGE_REASON.LIVE_STAGE_NOT_ADMITTED, thief);
@@ -1047,8 +1063,45 @@ test('849. (M28) a VALID ticket cannot be consumed by a different stage in the s
   const rightful = invoker.invoke({
     provider_id: LIVE_TEXT_CAPABILITY_ID,
     input: buildLiveScriptPrompt(stack.scriptInput),
-    agent_slug: S.SCRIPT_LIVE,
+    agent_slug: S.SCRIPT_LIVE, task_id: TASK, tree_id: WORKFLOW,
   });
   assert.equal(rightful.status, 'ok', 'a refused theft must not burn the ticket');
   assert.equal(stack.fetchImpl.calls.length, 1, 'and still exactly one network call');
+});
+
+test('850. (M29 addition) a ticket resolved for one task cannot be honoured for another — even under the SAME agent', async () => {
+  const stack = liveStack();
+  const ticket = await resolveLiveStageContent({
+    store: stack.store, chain: stack.chain, config: stack.config,
+    agent_slug: S.SCRIPT_LIVE, task_id: TASK, workflow_id: WORKFLOW,
+    input: buildLiveScriptPrompt(stack.scriptInput),
+  });
+  assert.equal(ticket.admitted, true);
+  assert.equal(ticket.task_id, TASK);
+  assert.equal(ticket.workflow_id, WORKFLOW);
+
+  const invoker = createLiveCapableInvoker({ deterministicInvoker: stack.deterministicInvoker, ticket });
+
+  for (const [label, override] of [
+    ['different task_id', { task_id: 'task-other' }],
+    ['different workflow', { tree_id: 'wf-other' }],
+    ['both different', { task_id: 'task-other', tree_id: 'wf-other' }],
+    ['missing entirely', { task_id: undefined, tree_id: undefined }],
+  ]) {
+    const r = invoker.invoke({
+      provider_id: LIVE_TEXT_CAPABILITY_ID,
+      input: buildLiveScriptPrompt(stack.scriptInput),
+      agent_slug: S.SCRIPT_LIVE, task_id: TASK, tree_id: WORKFLOW, ...override,
+    });
+    assert.equal(r.status, 'failed', label);
+    assert.equal(r.reason, LIVE_STAGE_REASON.LIVE_TICKET_SCOPE_MISMATCH, label);
+    assert.equal(stack.fetchImpl.calls.length, 1, `${label}: no second network call`);
+  }
+
+  // The rightful, exact scope still works and burns the ticket.
+  const rightful = invoker.invoke({
+    provider_id: LIVE_TEXT_CAPABILITY_ID, input: buildLiveScriptPrompt(stack.scriptInput),
+    agent_slug: S.SCRIPT_LIVE, task_id: TASK, tree_id: WORKFLOW,
+  });
+  assert.equal(rightful.status, 'ok');
 });

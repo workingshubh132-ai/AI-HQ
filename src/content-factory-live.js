@@ -108,6 +108,18 @@ export const LIVE_STAGE_REASON = Object.freeze({
   LIVE_REQUEST_MISMATCH: 'LIVE_REQUEST_MISMATCH',
   /** A second generateContent call inside one task. */
   LIVE_TICKET_ALREADY_USED: 'LIVE_TICKET_ALREADY_USED',
+  /**
+   * M29: the ticket was issued for a different task or a different
+   * workflow than the one actually running. M28 never needed this — one
+   * ticket, one workflow, one test at a time. M29 composes several
+   * tickets in one long-lived multi-stage invoker (see
+   * `createMultiStageLiveInvoker`), so a ticket that was resolved for
+   * task/workflow A must never be honoured for task/workflow B — even if
+   * some future bug in orchestration wiring made that ticket reachable
+   * there. Distinct from LIVE_STAGE_NOT_ADMITTED (wrong AGENT) and from
+   * LIVE_REQUEST_MISMATCH (wrong CONTENT): this is wrong SCOPE.
+   */
+  LIVE_TICKET_SCOPE_MISMATCH: 'LIVE_TICKET_SCOPE_MISMATCH',
 });
 
 /**
@@ -251,6 +263,7 @@ export async function resolveLiveStageContent({ store, chain, config, agent_slug
     return Object.freeze({
       admitted: false, reason: admission.reason, detail: admission.detail,
       network_attempted: false, providerResult: null, fingerprint: null, config: config ?? null,
+      task_id, workflow_id,
     });
   }
 
@@ -273,6 +286,14 @@ export async function resolveLiveStageContent({ store, chain, config, agent_slug
     providerResult,
     fingerprint: fingerprintLiveRequest({ provider_id: LIVE_TEXT_CAPABILITY_ID, input }),
     config,
+    // M29: the SCOPE this ticket was resolved for — the trusted task_id
+    // and workflow_id this function was called with, never anything from
+    // `input`. Checked again at consumption time so a ticket cannot be
+    // honoured for any other task or workflow, even one that reuses the
+    // same task_id string (task IDs are not namespaced by workflow
+    // anywhere in this codebase's fixtures or conventions).
+    task_id,
+    workflow_id,
   });
 }
 
@@ -332,6 +353,18 @@ export function createLiveCapableInvoker({ deterministicInvoker, ticket = null }
         `${request?.agent_slug ?? 'unknown'} is not the configured live-capable stage`,
       );
     }
+    // M29: `task_id` and `tree_id` (workflow_id) reaching this function
+    // are ALSO runtime.js's own — the same trusted closure that supplies
+    // `agent_slug` supplies these (see runtime.js's `generateContent`).
+    // A ticket resolved for one task/workflow must not be honoured for
+    // any other, even under the same agent.
+    if (request?.task_id !== ticket.task_id || request?.tree_id !== ticket.workflow_id) {
+      return refuse(
+        LIVE_STAGE_REASON.LIVE_TICKET_SCOPE_MISMATCH,
+        `ticket was issued for task ${ticket.task_id} in workflow ${ticket.workflow_id}, `
+          + `not task ${request?.task_id ?? 'unknown'} in workflow ${request?.tree_id ?? 'unknown'}`,
+      );
+    }
     if (consumed) {
       return refuse(
         LIVE_STAGE_REASON.LIVE_TICKET_ALREADY_USED,
@@ -353,4 +386,96 @@ export function createLiveCapableInvoker({ deterministicInvoker, ticket = null }
   }
 
   return Object.freeze({ invoke, get consumed() { return consumed; } });
+}
+
+/**
+ * PHASE 2, MULTI-STAGE (Milestone 29) — the same synchronous facade as
+ * `createLiveCapableInvoker`, generalized to serve SEVERAL independently
+ * ticketed live agents within one long-lived runtime.
+ *
+ * ── WHY A ROUTER, NOT A BIGGER TICKET ─────────────────────────────────────
+ *
+ * `content-factory-orchestrator.js` (protected, unmodified) drives an
+ * entire workflow through ONE `createRuntime()` instance — its own header
+ * explains exactly why: task-by-task external proposal, not
+ * self-chaining. A real multi-stage live pipeline (research → script →
+ * hook → social package) therefore needs ONE `providerInvoker` that
+ * survives the whole run, yet each live stage's ticket can only be
+ * resolved once its own task is about to run — script needs research's
+ * REAL artifact id first. The invoker must accept tickets installed
+ * incrementally as the pipeline progresses, not all at construction time.
+ *
+ * This router adds EXACTLY that, and nothing else. Each ticket, once
+ * installed, is handed to an unmodified `createLiveCapableInvoker` — so
+ * every property M28 already proved and mutation-tested (caller binding,
+ * fingerprint match, single-use) applies per-agent, unchanged. The
+ * router's OWN job is one lookup: given the request's TRUSTED
+ * `agent_slug` (from runtime.js's closure, never from the handler),
+ * find that agent's own sub-invoker, or refuse.
+ *
+ * ── WHY THIS IS NOT MODULE-GLOBAL MUTABLE STATE ──────────────────────────
+ *
+ * `installTicket`'s map lives in ONE closure, created fresh by ONE call
+ * to `createMultiStageLiveInvoker()` — there is no state shared across
+ * separate calls to this factory, and therefore none shared across
+ * separate workflow runs (each run gets its own instance, exactly as
+ * M28's per-run stack did with a single ticket). Two concurrent
+ * workflows never see each other's tickets, because they never share a
+ * Map — a stronger, structural version of the same guarantee M26's
+ * per-call carrier object established for concurrent invocations.
+ *
+ * ── AN AGENT MAY BE TICKETED AT MOST ONCE PER RUN ────────────────────────
+ *
+ * `installTicket` throws on a second call for the same agent slug. This
+ * is not merely tidiness: without it, an orchestration bug that re-ran a
+ * live stage's phase 1 and re-installed a fresh ticket would silently
+ * reset `createLiveCapableInvoker`'s own single-use flag, defeating the
+ * "at most one provider call per task" guarantee M28 built. Refusing the
+ * second install makes that reset structurally impossible rather than a
+ * discipline someone has to remember.
+ *
+ * @param {object} deps
+ * @param {{invoke:Function}} deps.deterministicInvoker
+ */
+export function createMultiStageLiveInvoker({ deterministicInvoker }) {
+  /** @type {Map<string, {invoke:Function}>} */
+  const perAgent = new Map();
+
+  function installTicket(agentSlug, ticket) {
+    if (typeof agentSlug !== 'string' || agentSlug === '') {
+      throw new Error('createMultiStageLiveInvoker.installTicket: agentSlug must be a non-empty string');
+    }
+    if (perAgent.has(agentSlug)) {
+      throw new Error(
+        `createMultiStageLiveInvoker.installTicket: ${agentSlug} already has a ticket installed for this run — `
+          + 're-installing would silently reset its single-use guarantee',
+      );
+    }
+    perAgent.set(agentSlug, createLiveCapableInvoker({ deterministicInvoker, ticket }));
+  }
+
+  function invoke(request) {
+    if (request?.provider_id !== LIVE_TEXT_CAPABILITY_ID) {
+      // Not a live request. Every other specialist behaves exactly as it
+      // always has, whether or not any live ticket exists in this run.
+      return deterministicInvoker.invoke(request);
+    }
+    const sub = perAgent.get(request?.agent_slug);
+    if (!sub) {
+      return {
+        status: 'failed',
+        reason: LIVE_STAGE_REASON.LIVE_STAGE_NOT_ADMITTED,
+        detail: `no live ticket was installed for ${request?.agent_slug ?? 'unknown'} in this run`,
+        output: null,
+        network_attempted: false,
+      };
+    }
+    return sub.invoke(request);
+  }
+
+  return Object.freeze({
+    invoke,
+    installTicket,
+    hasTicket: (agentSlug) => perAgent.has(agentSlug),
+  });
 }

@@ -126,26 +126,32 @@ test('561. each content-factory agent has a distinct, single declared capability
   registerContentFactoryAgents(store);
 
   // Two agents are OPT-IN ONLY and must not be registered by default:
-  // the adversarial rogue fixture, and M28's live-capable script stage.
+  // the adversarial rogue fixture, and every M28/M29 live-capable stage.
   // Asserted, not silently filtered — "the money-spending agent is absent
   // unless someone explicitly asked for it" is the invariant that keeps
   // an ordinary Content Factory run deterministic.
-  for (const optIn of [S.ROGUE, S.SCRIPT_LIVE]) {
+  const OPT_IN_ONLY = [S.ROGUE, S.SCRIPT_LIVE, S.RESEARCH_LIVE, S.HOOK_LIVE, S.SOCIAL_PACKAGE_LIVE];
+  for (const optIn of OPT_IN_ONLY) {
     assert.equal(store.getAgent(optIn), null, `${optIn} must not be registered by default`);
   }
 
   const caps = Object.values(CONTENT_FACTORY_AGENTS)
-    .filter((a) => a.record.slug !== S.ROGUE && a.record.slug !== S.SCRIPT_LIVE)
+    .filter((a) => !OPT_IN_ONLY.includes(a.record.slug))
     .map((a) => store.getAgent(a.record.slug).capabilities[0]);
   assert.equal(new Set(caps).size, caps.length, 'no two legitimate agents share a capability');
 
-  // And the live stage's capability is distinct from the deterministic
-  // script stage's. If they shared one, the router would be free to send
+  // And every live stage's capability is distinct from its deterministic
+  // counterpart's. If they shared one, the router would be free to send
   // an ordinary run to the agent that spends real money.
-  const live = CONTENT_FACTORY_AGENTS.scriptLive.version.capabilities[0];
-  const deterministic = CONTENT_FACTORY_AGENTS.script.version.capabilities[0];
-  assert.notEqual(live, deterministic, 'the live stage must not share the deterministic stage\'s capability');
-  assert.equal(caps.includes(live), false, 'and no registered agent may declare it');
+  for (const [liveKey, detKey] of [
+    ['scriptLive', 'script'], ['researchLive', 'research'],
+    ['hookLive', 'hook'], ['socialPackageLive', 'socialPackage'],
+  ]) {
+    const live = CONTENT_FACTORY_AGENTS[liveKey].version.capabilities[0];
+    const deterministic = CONTENT_FACTORY_AGENTS[detKey].version.capabilities[0];
+    assert.notEqual(live, deterministic, `${liveKey} must not share ${detKey}'s capability`);
+    assert.equal(caps.includes(live), false, `and no default-registered agent may declare ${live}`);
+  }
 });
 
 test('562. every content-factory agent version has resource limits within validator.js\'s own POLICY ceilings', async () => {

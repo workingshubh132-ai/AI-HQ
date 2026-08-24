@@ -282,3 +282,64 @@ so the task fails instead.
 
 See DECISIONS.md D45 for the full rationale, the four new reason codes,
 and the two real gaps mutation testing found.
+
+---
+
+## Four live stages, one pipeline (Milestone 29)
+
+M28's single live stage is now four: `cf-research-live-agent`,
+`cf-script-live-agent`, `cf-hook-live-agent`, and
+`cf-social-package-live-agent`. Every other specialist — fact-check,
+idea, audio, image, video, subtitle, quality control, publishing —
+remains deterministic.
+
+```
+TOPIC
+  -> RESEARCH (live)
+  -> FACT_CHECK, IDEA (deterministic — QC/publishing require them)
+  -> SCRIPT (live)
+  -> HOOK (live)
+  -> AUDIO, VISUAL, SUBTITLE, VIDEO_PLAN (deterministic)
+  -> SOCIAL_PACKAGE (live)
+  -> QUALITY_CONTROL, PUBLISHING_PACKAGE (deterministic, unmodified)
+  -> CONTENT_PACKAGE
+```
+
+Each live stage is opt-in individually
+(`registerContentFactoryLiveResearchAgent`, etc.) or all at once
+(`registerAllContentFactoryLiveTextAgents`) — never by
+`registerContentFactoryAgents()`.
+
+### One invoker, several tickets
+
+`content-factory-orchestrator.js` (unmodified) drives a whole workflow
+through one long-lived runtime. `createMultiStageLiveInvoker` extends
+M28's single-ticket primitive to hold several: `installTicket(agentSlug,
+ticket)` is called by trusted orchestration code just before each live
+stage's task runs, and lookup at consumption time uses the request's
+TRUSTED `agent_slug` — so a ticket installed for research is not merely
+refused if presented as script, it is structurally absent from the map
+under script's key. An agent may be ticketed at most once per run;
+re-installing throws, so a bug can never reset a stage's single-use
+guarantee.
+
+### Ticket scope
+
+A ticket now carries the task and workflow it was resolved for, checked
+again at consumption. Presenting a genuine ticket under the wrong task
+id or the wrong workflow id fails `LIVE_TICKET_SCOPE_MISMATCH` — a
+gap M28 never needed to close, since it only ever ran one ticket at a
+time.
+
+### What was proven, not assumed
+
+Eight explicit ticket-transfer attacks (research→script, script→hook,
+hook→social-package, cross-workflow, replay, tampered payload, tampered
+task id, tampered artifact type) each deny with zero network calls.
+Every Guardian freeze and lifecycle state is tested against each of the
+four live stages independently, plus a mid-pipeline freeze that leaves
+a completed stage's artifact valid while the next stage never runs.
+Concurrent live calls are proven not to cross-contaminate provenance or
+content, including the adversarial case of two calls sharing one
+request object. See DECISIONS.md D46 for the full design and the two
+mutation-testing findings it produced.

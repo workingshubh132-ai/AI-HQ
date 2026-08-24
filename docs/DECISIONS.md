@@ -3313,6 +3313,158 @@ register it — an operator must opt in explicitly, the same way the
 adversarial rogue fixture has always worked. Connecting audio, image,
 video, publishing, or the CEO remains a separate milestone.
 
+## D46 — Four independently ticketed live text stages, one governed pipeline
+
+Decided 2026-08-24 (Milestone 29).
+
+M28 connected exactly one Content Factory stage to the governed Groq
+boundary. M29 asks whether SEVERAL live stages can compose in one
+workflow without multiplying spending, without a second authorization
+path, and without one stage being able to touch another's paid result.
+
+**No protected file was modified.** `broker.js`, `validator.js`,
+`runtime.js`, `workflow.js`, `router.js`, `guardian.js`,
+`approval-engine.js`, `execution-coordinator.js`, `resource-governor.js`,
+`ceo-agent.js`, `src/ceo/`, and `content-factory-orchestrator.js` are all
+byte-identical to the milestone's start commit. No new dependency was
+added.
+
+### The new live stages
+
+`cf-research-live-agent` (RESEARCH), `cf-hook-live-agent` (TEXT),
+`cf-social-package-live-agent` (SOCIAL_PACKAGE) join M28's
+`cf-script-live-agent` (SCRIPT). Each has its own capability
+(`cf-research-live`, `cf-hook-live`, `cf-social-package-live`),
+distinct from its deterministic counterpart for the same reason M28's
+`cf-script-live` was: sharing a capability with a deterministic stage
+would leave the router free to send an ordinary run to the agent that
+spends money. Each is registered only by its own explicit opt-in
+function; `registerContentFactoryAgents()` still registers none of them.
+
+### The architectural problem M29 actually had to solve
+
+`content-factory-orchestrator.js` drives an entire workflow through ONE
+long-lived `createRuntime()` instance — its own header explains why:
+task-by-task external proposal, not self-chaining. M28's ticket was
+built around exactly one live stage, sealed at construction time. A real
+multi-stage pipeline needs ONE `providerInvoker` that survives the whole
+run, yet each stage's ticket can only be resolved once its own task is
+about to run — script needs research's REAL artifact id first, which
+does not exist until research has actually completed.
+
+**`createMultiStageLiveInvoker`** solves this by generalizing the
+container, not the primitive. It holds a map of per-agent sub-invokers,
+each one an UNMODIFIED `createLiveCapableInvoker({ deterministicInvoker,
+ticket })` — the exact M28 primitive, mutation-tested and unchanged.
+`installTicket(agentSlug, ticket)` adds one ticket, callable only by
+trusted orchestration code, never by a handler or a request. Lookup at
+invocation time uses the request's TRUSTED `agent_slug` (from
+`runtime.js`'s own closure, never from the handler) — so a ticket
+installed for research is not merely REFUSED if presented as script, it
+is structurally UNREACHABLE under script's slug; the map never contains
+it there.
+
+**An agent may be ticketed at most once per run.** `installTicket`
+throws on a second call for the same slug. Without this, an
+orchestration bug that re-ran phase 1 and re-installed a fresh ticket
+would silently reset the single-use flag M28 built — turning "one call
+per task" into "one call per install," which is not the same guarantee.
+Test 874 proves this directly, and it is the target of mutation M22.
+
+**No module-global mutable state.** `perAgent`'s map lives in ONE
+closure, created fresh by one call to `createMultiStageLiveInvoker()`.
+Two workflow runs never share a Map, so they never share tickets —
+structurally, not by convention.
+
+### The scope-binding gap M29 found and closed
+
+M28's ticket carried a fingerprint of the request but nothing that
+scoped it to a TASK or a WORKFLOW — M28 never needed that, since exactly
+one ticket existed per test, per workflow, at a time. Composing several
+tickets in one long-lived invoker changes that: a ticket resolved for
+task/workflow A must never be honoured for task/workflow B, even reusing
+the same task_id string (task IDs are not namespaced by workflow
+anywhere in this codebase's conventions).
+
+`resolveLiveStageContent` now returns `task_id` and `workflow_id` on the
+ticket — the function's own trusted arguments, never from `input` — and
+`createLiveCapableInvoker` checks both against the request's own
+trusted `task_id`/`tree_id` (the same fields `runtime.js`'s closure
+already supplies, confirmed by reading its `generateContent` wiring).
+Mismatch fails with the new `LIVE_TICKET_SCOPE_MISMATCH` — distinct from
+`LIVE_STAGE_NOT_ADMITTED` (wrong AGENT) and `LIVE_REQUEST_MISMATCH`
+(wrong CONTENT): this is wrong SCOPE. Genuinely new, and documented
+here per the milestone's own instruction not to invent a duplicate.
+
+### Why FACT_CHECK and IDEA stayed deterministic
+
+The M29 directive's own diagram shows RESEARCH flowing directly into
+SCRIPT. The existing, unmodified `QC_REQUIRED_STAGES` and
+`publishingPackageHandler` machinery, however, requires all ten content
+stages — including `fact_check` and `idea` — to be present with the
+correct artifact type before a CONTENT_PACKAGE can be built; editing
+that machinery for this milestone's convenience was rejected the same
+way an async runtime twin was rejected in M28: it would grow a
+protected-adjacent boundary's surface for one milestone's shape. Both
+stages remain deterministic — they are TEXT-generating, but the
+directive named exactly four stages to make live, and fact-check/idea
+were not among them.
+
+### Two mutation survivors, both investigated
+
+Twenty mutations targeted the eleven-category, twenty-four-item list
+the milestone names. Two survived on the first pass.
+
+**Lineage binding on the social-package handler's parent ids** appeared
+to survive when `String(input.script_artifact_id)` was replaced with the
+raw `input.script_artifact_id`. Investigated directly: `artifact-
+service.js`'s own parent-artifact validation (`isNonEmptyString`, real
+existence, same-workflow, no-cycle — unmodified, independently tested)
+rejects a non-string or nonexistent parent in BOTH the coerced and
+uncoerced case, empirically confirmed against a bare number and a
+`toString`-hijacking object — every case is refused; only the specific
+error code differs (`PARENT_NOT_FOUND` vs `INVALID_PARENT_ID`). The real
+security boundary for lineage integrity is one layer downstream, in code
+this milestone does not modify and does not need to duplicate. Genuinely
+redundant, not a coverage gap — proven structurally, per the milestone's
+own instruction, rather than dismissed because another test happened to
+fail first.
+
+**Concurrent-call isolation** survived because every caller in this
+codebase — including this milestone's own `resolveLiveStageContent` —
+builds a fresh request object literal per call, so `live-guard.js`'s
+per-call carrier clone (`{ ...request }`, vs. aliasing `request`
+directly) never had an adversarial case to defend in any existing test.
+This was a REAL gap: a future caller that reused one request object
+across two concurrent live calls would let the second call's governor
+response overwrite the first's `CARRIER_KEY` on the shared object,
+corrupting whichever call read it later. Test 887 constructs exactly
+that case directly — two concurrent `chain.invoke()` calls sharing one
+request object, racing on purpose — and confirms each result carries
+only its own content. The mutation is now killed for real, and the
+carrier clone changed from defensive style to a proven invariant.
+
+### Multi-stage properties proven, not assumed
+
+Per the milestone's own instruction not to assume single-stage safety
+composes automatically: every Guardian freeze/lifecycle state is tested
+against EACH of the four live stages independently (test 863); a
+mid-pipeline workflow freeze is tested to stop the pipeline after
+research succeeds, leaving that artifact valid while script never
+executes (test 864); budget denial at all four scopes is tested per
+stage, not just once (test 886); and eight explicit ticket-transfer
+attacks (research→script, script→hook, hook→social-package,
+cross-workflow, replay, payload tamper, task-id tamper, artifact-type
+tamper) are each proven to deny with zero network calls.
+
+### Live status
+
+**LIVE GROQ: GATED**, unchanged from M27/M28. This environment's egress
+policy still denies `api.groq.com`; M29 made no attempt to work around
+it. Every test in this milestone runs against an injected `fetchImpl`
+and reaches no network. No real inference occurred and no money was
+spent.
+
 ## Deliberately deferred
 
 Not decided yet, and not needed yet. Listed so they are not forgotten.

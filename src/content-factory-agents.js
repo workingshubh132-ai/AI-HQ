@@ -61,10 +61,15 @@ export const CONTENT_FACTORY_CAPABILITY = Object.freeze({
   FACT_CHECK: 'cf-fact-check',
   IDEA: 'cf-idea',
   SCRIPT: 'cf-script',
-  /** M28: DISTINCT from SCRIPT on purpose. Sharing a capability with
-   * the deterministic script stage would leave the router free to send
-   * an ordinary run to the agent that spends money. */
+  /** M28/M29: each live capability is DISTINCT from its deterministic
+   * counterpart, on purpose. Sharing a capability with a deterministic
+   * stage would leave the router free to send an ordinary run to the
+   * agent that spends money — test 561 caught exactly this the first
+   * time M28 was built. */
   SCRIPT_LIVE: 'cf-script-live',
+  RESEARCH_LIVE: 'cf-research-live',
+  HOOK_LIVE: 'cf-hook-live',
+  SOCIAL_PACKAGE_LIVE: 'cf-social-package-live',
   HOOK: 'cf-hook',
   AUDIO: 'cf-audio',
   VISUAL: 'cf-visual',
@@ -88,9 +93,12 @@ export const CONTENT_FACTORY_AGENT_SLUGS = Object.freeze({
   VIDEO_PLAN: 'cf-video-plan-agent',
   QUALITY_CONTROL: 'cf-quality-control-agent',
   PUBLISHING_PACKAGE: 'cf-publishing-package-agent',
-  /** M28: the ONE live-capable specialist. Registered only by an
-   * explicit opt-in call, never by registerContentFactoryAgents(). */
+  /** M28/M29: the live-capable specialists. Each is registered only by
+   * an explicit opt-in call, never by registerContentFactoryAgents(). */
   SCRIPT_LIVE: 'cf-script-live-agent',
+  RESEARCH_LIVE: 'cf-research-live-agent',
+  HOOK_LIVE: 'cf-hook-live-agent',
+  SOCIAL_PACKAGE_LIVE: 'cf-social-package-live-agent',
   ROGUE: 'cf-rogue-agent',
 });
 
@@ -240,6 +248,37 @@ function scriptLiveHandler({ input, generateContent }) {
   };
 }
 
+// ── 1b. Research (M29: a second live-capable stage) ────────────────────────
+
+/** Same discipline as `buildLiveScriptPrompt`: a pure function of the
+ * safe input fields only, so governance (which pays for this exact
+ * prompt) and the handler (which asks for it) can never disagree. */
+export function buildLiveResearchPrompt({ topic }) {
+  return {
+    text: `Write a short, structured research brief about "${String(topic ?? 'untitled topic')}". `
+      + 'Three factual bullet points. Plain text only. Keep it under 120 words.',
+  };
+}
+
+/** Identical shape to `researchHandler`, naming the live sentinel. No
+ * parent artifact — research is the pipeline's root, exactly like its
+ * deterministic counterpart. */
+function researchLiveHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const artifact = requireGenerated(generateContent({
+    provider_id: LIVE_TEXT_CAPABILITY_ID,
+    model_id: input.model_id ?? null, // ignored downstream; see scriptLiveHandler's note
+    input: buildLiveResearchPrompt({ topic }),
+    artifact_type: ARTIFACT_TYPE.RESEARCH,
+    reason: 'cf-research-live-agent: research brief (live provider)',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, research_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type, live: true },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
 // ── 5. Hook ───────────────────────────────────────────────────────────────
 
 function hookHandler({ input, generateContent }) {
@@ -255,6 +294,43 @@ function hookHandler({ input, generateContent }) {
   return {
     status: 'ok',
     result: { topic, hook_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type, content_length: byteLengthOf(artifact.content) },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 5b. Hook (M29: a second live-capable stage) ────────────────────────────
+
+export function buildLiveHookPrompt({ topic, script_artifact_id }) {
+  // Same discipline as buildLiveScriptPrompt: the internal artifact id is
+  // accepted only to make "it is deliberately excluded" an explicit
+  // choice, never sent to a third party.
+  void script_artifact_id;
+  return {
+    text: `Write three short, punchy opening hook lines for a video about "${String(topic ?? 'untitled topic')}". `
+      + 'One per line. Plain text only. Keep the whole thing under 80 words.',
+  };
+}
+
+/** Artifact type is TEXT — identical to the deterministic hook stage, so
+ * "went live" changes the provider, never the contract downstream
+ * stages already rely on. */
+function hookLiveHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const scriptParent = String(input.script_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: LIVE_TEXT_CAPABILITY_ID,
+    model_id: input.model_id ?? null,
+    input: buildLiveHookPrompt({ topic, script_artifact_id: scriptParent }),
+    artifact_type: ARTIFACT_TYPE.TEXT,
+    parent_artifact_ids: [scriptParent],
+    reason: 'cf-hook-live-agent: hook lines (live provider)',
+  }));
+  return {
+    status: 'ok',
+    result: {
+      topic, hook_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type,
+      content_length: byteLengthOf(artifact.content), live: true,
+    },
     confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
   };
 }
@@ -313,6 +389,43 @@ function socialPackageHandler({ input, generateContent }) {
   return {
     status: 'ok',
     result: { social_package_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type },
+    confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
+  };
+}
+
+// ── 8b. Social Package (M29: a second live-capable stage, TWO real parents) ─
+
+export function buildLiveSocialPackagePrompt({ topic, script_artifact_id, hook_artifact_id }) {
+  void script_artifact_id;
+  void hook_artifact_id;
+  return {
+    text: `Write platform-ready social copy for a short video about "${String(topic ?? 'untitled topic')}": `
+      + 'one caption, one short description, three hashtags, and one call-to-action. '
+      + 'Plain text only. Content generation only — do not address a platform or claim to post anywhere. '
+      + 'Keep the whole thing under 100 words.',
+  };
+}
+
+/** Two REAL parents — script and hook — matching the deterministic
+ * stage's own lineage exactly. Artifact type is SOCIAL_PACKAGE. This is
+ * content GENERATION only: the prompt itself instructs the model not to
+ * claim posting, and nothing downstream of this handler ever reaches an
+ * external platform — see this file's header and DECISIONS.md D46. */
+function socialPackageLiveHandler({ input, generateContent }) {
+  const topic = String(input.topic ?? 'untitled topic');
+  const scriptParent = String(input.script_artifact_id);
+  const hookParent = String(input.hook_artifact_id);
+  const artifact = requireGenerated(generateContent({
+    provider_id: LIVE_TEXT_CAPABILITY_ID,
+    model_id: input.model_id ?? null,
+    input: buildLiveSocialPackagePrompt({ topic, script_artifact_id: scriptParent, hook_artifact_id: hookParent }),
+    artifact_type: ARTIFACT_TYPE.SOCIAL_PACKAGE,
+    parent_artifact_ids: [scriptParent, hookParent],
+    reason: 'cf-social-package-live-agent: social copy (live provider)',
+  }));
+  return {
+    status: 'ok',
+    result: { topic, social_package_artifact_id: artifact.artifact_id, artifact_type: artifact.artifact_type, live: true },
     confidence: 'high', assumptions: [], evidence: [], proposed_actions: [], cost: {}, errors: [],
   };
 }
@@ -589,6 +702,9 @@ function outputArtifactTypeFor(capability) {
     [CAP.IDEA]: [ARTIFACT_TYPE.TEXT],
     [CAP.SCRIPT]: [ARTIFACT_TYPE.SCRIPT],
     [CAP.SCRIPT_LIVE]: [ARTIFACT_TYPE.SCRIPT],
+    [CAP.RESEARCH_LIVE]: [ARTIFACT_TYPE.RESEARCH],
+    [CAP.HOOK_LIVE]: [ARTIFACT_TYPE.TEXT],
+    [CAP.SOCIAL_PACKAGE_LIVE]: [ARTIFACT_TYPE.SOCIAL_PACKAGE],
     [CAP.HOOK]: [ARTIFACT_TYPE.TEXT],
     [CAP.AUDIO]: [ARTIFACT_TYPE.AUDIO],
     [CAP.VISUAL]: [ARTIFACT_TYPE.IMAGE],
@@ -667,6 +783,22 @@ export const CONTENT_FACTORY_AGENTS = Object.freeze({
     'M28: writes a SCRIPT artifact through the governed LIVE provider boundary. Registered only on explicit opt-in.',
     scriptLiveHandler, { inputRequired: ['topic', 'idea_artifact_id'], outputRequired: ['script_artifact_id'] },
   ),
+  researchLive: makeContentFactoryAgent(
+    S.RESEARCH_LIVE, 'agent-cf-research-live', CAP.RESEARCH_LIVE,
+    'M29: writes a RESEARCH artifact through the governed LIVE provider boundary. Registered only on explicit opt-in.',
+    researchLiveHandler, { inputRequired: ['topic'], outputRequired: ['research_artifact_id'] },
+  ),
+  hookLive: makeContentFactoryAgent(
+    S.HOOK_LIVE, 'agent-cf-hook-live', CAP.HOOK_LIVE,
+    'M29: writes a TEXT (hook) artifact through the governed LIVE provider boundary. Registered only on explicit opt-in.',
+    hookLiveHandler, { inputRequired: ['topic', 'script_artifact_id'], outputRequired: ['hook_artifact_id'] },
+  ),
+  socialPackageLive: makeContentFactoryAgent(
+    S.SOCIAL_PACKAGE_LIVE, 'agent-cf-social-package-live', CAP.SOCIAL_PACKAGE_LIVE,
+    'M29: writes a SOCIAL_PACKAGE artifact (content generation only — never posts) through the governed LIVE '
+      + 'provider boundary. Registered only on explicit opt-in.',
+    socialPackageLiveHandler, { inputRequired: ['topic', 'script_artifact_id', 'hook_artifact_id'], outputRequired: ['social_package_artifact_id'] },
+  ),
   rogue: makeContentFactoryAgent(
     S.ROGUE, 'agent-cf-rogue', CAP.RESEARCH,
     'Adversarial fixture: forges identity fields in a generateContent request and emits authorization-shaped output. Never registered by default.',
@@ -702,6 +834,48 @@ export function registerContentFactoryLiveScriptAgent(store) {
   store.addAgentVersion(version);
   store.registerAgent(record);
   return record.slug;
+}
+
+/** M29: registers ONLY the live-capable research specialist. Same
+ * explicit-opt-in discipline as `registerContentFactoryLiveScriptAgent`. */
+export function registerContentFactoryLiveResearchAgent(store) {
+  const { version, record } = CONTENT_FACTORY_AGENTS.researchLive;
+  store.addAgentVersion(version);
+  store.registerAgent(record);
+  return record.slug;
+}
+
+/** M29: registers ONLY the live-capable hook specialist. */
+export function registerContentFactoryLiveHookAgent(store) {
+  const { version, record } = CONTENT_FACTORY_AGENTS.hookLive;
+  store.addAgentVersion(version);
+  store.registerAgent(record);
+  return record.slug;
+}
+
+/** M29: registers ONLY the live-capable social-package specialist. */
+export function registerContentFactoryLiveSocialPackageAgent(store) {
+  const { version, record } = CONTENT_FACTORY_AGENTS.socialPackageLive;
+  store.addAgentVersion(version);
+  store.registerAgent(record);
+  return record.slug;
+}
+
+/**
+ * M29: registers all four live-capable text specialists at once — a
+ * convenience for a full live pipeline run. Still opt-in: not called by
+ * `registerContentFactoryAgents()`, and calling it registers agents
+ * only — nothing about it enables Groq, sets a budget, or configures a
+ * single stage. Every stage still needs its own `createLiveStageConfig`
+ * and its own governed ticket before it can spend anything.
+ */
+export function registerAllContentFactoryLiveTextAgents(store) {
+  return [
+    registerContentFactoryLiveResearchAgent(store),
+    registerContentFactoryLiveScriptAgent(store),
+    registerContentFactoryLiveHookAgent(store),
+    registerContentFactoryLiveSocialPackageAgent(store),
+  ];
 }
 
 /** Registers ONLY the adversarial fixture. */
